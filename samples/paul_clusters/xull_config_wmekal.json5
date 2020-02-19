@@ -1,0 +1,15 @@
+{
+  "sample_csv": "/archive/dt237/XULL/samples/paul_clusters/all_paul_clusters.csv",
+  "generate_combined": false,
+  "force_rad": true,
+  "xmm_data_path": "/run/user/1000/gvfs/sftp:host=apollo/mnt/pact/dt237/xmm_obs/data",
+  "xmm_reg_path": "/run/user/1000/gvfs/sftp:host=apollo/mnt/pact/dt237/xmm_obs/code/xapa/id_results",
+  "back_outer_factor": 1.5,
+  "id_col": "objid",
+  "ra_col": "ra",
+  "dec_col": "dec",
+  "produce_plots": true,
+  "models": {
+    "tbabs*apec": {"nh": -1, "kT": [1, 10, 15], "abund": [0.1, 0.5, 10], "redshift": -1, "Norm": 1},
+    "tbabs*mekal": {"nh": -1, "kT": [1, 10, 15], "m_nH": 1, "abund": [0.1, 0.5, 10], "redshift": -1, "Norm": 1}},
+  "allowed_cores": 20}
