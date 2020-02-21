@@ -11,4 +11,5 @@
   "produce_plots": true,
   "models": {
     "tbabs*apec": {"nh": -1, "kT": [1, 10, 15], "abund": [0.1, 0.5, 10], "redshift": -1, "Norm": 1}},
-  "allowed_cores": 20}
+  "allowed_cores": 20,
+  "conf_level": 90}
