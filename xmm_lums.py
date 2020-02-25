@@ -10,20 +10,25 @@ import warnings
 from copy import deepcopy
 from functools import partial
 from multiprocessing.dummy import Pool
-from subprocess import call
 from subprocess import DEVNULL as DNULL
+from subprocess import call
 
 import imageio
 import matplotlib.pyplot as plt
 import pandas as pd
 import xspec as x
+from astropy import units as u
+from astropy.units import UnitConversionError
 from astropy import wcs
 from astropy.cosmology import Planck15
 from astropy.io import fits
-from numpy import sqrt, linspace, meshgrid, empty, uint8, frombuffer, ndenumerate, pi, zeros
+from numpy import sqrt, linspace, meshgrid, empty, uint8, frombuffer, ndenumerate, pi, percentile, isnan
+from scipy.stats import truncnorm
 from tqdm import tqdm
 
 warnings.simplefilter('ignore', wcs.FITSFixedWarning)
+# TODO Make the energy bands completely general, and passable in through the config file
+# TODO Generalise Cosmology
 
 
 def validate_config(conf_dict):
@@ -57,8 +62,9 @@ def validate_config(conf_dict):
 
         return new_m_dict
 
-    required_head = ["sample_csv", "generate_combined", "force_rad", "xmm_data_path", "xmm_reg_path",
-                     "back_outer_factor", "id_col", "ra_col", "dec_col", "produce_plots", "models", "allowed_cores"]
+    required_head = ["sample_csv", "generate_combined", "force_rad", "xmm_data_path", "xmm_reg_path", "produce_plots",
+                     "back_outer_factor", "id_col", "ra_col", "dec_col", "rad_col", "rad_unit", "models",
+                     "allowed_cores", "conf_level"]
 
     missing = False
     for el in required_head:
@@ -121,18 +127,49 @@ def validate_config(conf_dict):
     if not isinstance(conf_dict["models"], dict):
         sys.exit("models must be supplied as a dictionary, even if you are only using one")
     else:
-        print("IF YOU WANT A MODEL PARAMETER TO BE READ FROM THE SAMPLE, PUT IT AS -1")
-        print("PARAMETERS MUST BE IN THE ORDER THAT XSPEC EXPECTS THEM")
+        print("REDSHIFT IS READ FROM THE SAMPLE, AND NH IS READ FROM HEASOFT, VALUES IN MODEL WILL BE DISCARDED")
+        # print("PARAMETERS MUST BE IN THE ORDER THAT XSPEC EXPECTS THEM")
         for entry in conf_dict["models"]:
             conf_dict["models"][entry] = model_parser(conf_dict["models"][entry])
 
     if not isinstance(conf_dict["allowed_cores"], int):
         sys.exit("allowed_cores should be an integer value.")
 
+    if not isinstance(conf_dict["conf_level"], int):
+        sys.exit("Please an integer percentage (e.g. 90) for conf_level")
+
+    if not isinstance(conf_dict["rad_col"], str):
+        sys.exit("rad_col must be a string")
+
+    if not isinstance(conf_dict["rad_unit"], str):
+        sys.exit("rad_unit must be a string representation of a distance unit, i.e. kpc or Mpc")
+    elif conf_dict["rad_unit"] == "mpc":
+        sys.exit("rad_col is case sensitive, mpc is milliparsecs...")
+    else:
+        try:
+            basic_quan = u.Quantity(1, conf_dict["rad_unit"])
+            basic_quan.to("m")
+        except ValueError as le_error:
+            if isinstance(le_error, UnitConversionError) and conf_dict["rad_unit"] not in ["arcsecond", "arcsec"]:
+                sys.exit(str(le_error))
+            elif isinstance(le_error, UnitConversionError) and conf_dict["rad_unit"] in ["arcsecond", "arcsec"]:
+                print("arcsecond is not a valid length unit in astropy, but this code accounts for that")
+            else:
+                sys.exit(conf_dict["rad_unit"] + " does not appear to be a valid Astropy unit.")
+
+    if not isinstance(conf_dict["redshift_col"], str):
+        sys.exit("redshift_col must be a string")
+
+    if not isinstance(conf_dict["type_col"], str):
+        sys.exit("type_col must be a string")
+
+    if not isinstance(conf_dict["xmm_obsid_col"], str):
+        sys.exit("xmm_obsid_col must be a string")
+
     return conf_dict
 
 
-def command_stack_maker(conf_dict, obj_id, obs_id, file_locs, src_r, excl_r, save_dir, ins, obj_type, for_comb=False):
+def command_stack_maker(conf_dict, obj_id, obs_id, file_locs, src_r, excl_r, save_dir, ins, obj_type, for_comb, z):
     centre = src_r[:2]
     radius = src_reg[2]
 
@@ -200,6 +237,15 @@ def command_stack_maker(conf_dict, obj_id, obs_id, file_locs, src_r, excl_r, sav
     back_spec_path = obj_id + "_" + obs_id + "_" + ins + "_back_spec.fits"
     grp_path = obj_id + "_" + obs_id + '_' + ins + '_grp.fits'
     cutout_reg_path = obj_id + "_" + obs_id + '_' + ins + '_cutouts.fits'
+    low_en_im_path = obj_id + "_" + obs_id + '_' + ins + '_lowen_im.fits'
+    high_en_im_path = obj_id + "_" + obs_id + '_' + ins + '_highen_im.fits'
+    low_en_expmap_path = obj_id + "_" + obs_id + '_' + ins + '_lowen_expmap.fits'
+    high_en_expmap_path = obj_id + "_" + obs_id + '_' + ins + '_highen_expmap.fits'
+
+    file_locs["e" + ins.lower() + "_lowen_im"] = s_dir + "/" + low_en_im_path
+    file_locs["e" + ins.lower() + "_lowen_expmap"] = s_dir + "/" + low_en_expmap_path
+    file_locs["e" + ins.lower() + "_highen_im"] = s_dir + "/" + high_en_im_path
+    file_locs["e" + ins.lower() + "_highen_expmap"] = s_dir + "/" + high_en_expmap_path
 
     # Constructs all commands related to spectrum generation.
     if not os.path.exists(save_dir + "/" + grp_path):
@@ -251,6 +297,49 @@ def command_stack_maker(conf_dict, obj_id, obs_id, file_locs, src_r, excl_r, sav
             .format(evts=evt_path, img=cutout_reg_path, exp=all_but_expression)
         cmds.append(cmd)
 
+        # Generating images and exposure maps appropriate for the redshift of the object in question
+        z_lowen = [int(limit / (z + 1)) for limit in [500, 2000]]
+        z_highen = [int(limit / (z + 1)) for limit in [2000, 10000]]
+
+        # Copying the expression from XCS energy limited images
+        if "PN" in ins:
+            z_expr = "expression='#XMMEA_EP && (PATTERN <= 4) && (FLAG .eq. 0) && (PI in [{l}:{u}])'"
+        elif "MOS" in ins:
+            z_expr = "expression='#XMMEA_EM && (PATTERN <= 12) && (FLAG .eq. 0) && (PI in [{l}:{u}])'"
+        else:
+            sys.exit("wtf is this instrument?")
+
+        # Lowen image with limits redshifted
+        cmd = "evselect table={evts} imageset={img} xcolumn=X ycolumn=Y ximagebinsize=87 " \
+              "yimagebinsize=87 squarepixels=yes ximagesize=512 yimagesize=512 imagebinning=binSize " \
+              "ximagemin=3649 ximagemax=48106 withxranges=yes yimagemin=3649 yimagemax=48106 " \
+              "withyranges=yes {exp}".format(evts=evt_path, img=low_en_im_path,
+                                             exp=z_expr.format(l=z_lowen[0], u=z_lowen[1]))
+        cmds.append(cmd)
+
+        # Highen image with limits redshifted
+        cmd = "evselect table={evts} imageset={img} xcolumn=X ycolumn=Y ximagebinsize=87 " \
+              "yimagebinsize=87 squarepixels=yes ximagesize=512 yimagesize=512 imagebinning=binSize " \
+              "ximagemin=3649 ximagemax=48106 withxranges=yes yimagemin=3649 yimagemax=48106 " \
+              "withyranges=yes {exp}".format(evts=evt_path, img=high_en_im_path,
+                                             exp=z_expr.format(l=z_highen[0], u=z_highen[1]))
+        cmds.append(cmd)
+
+        # Lowen expmap with limits redshifted
+        cmd = "eexpmap eventset={evts} imageset={img} expimageset={eimg} withdetcoords=no withvignetting=yes " \
+              "attitudeset={att} pimin={l} pimax={u}".format(evts=evt_path, img=low_en_im_path, eimg=low_en_expmap_path,
+                                                             att=file_locs["e" + ins.lower() + "_att"],
+                                                             l=z_lowen[0], u=z_lowen[1])
+        cmds.append(cmd)
+
+        # Highen expmap with limits redshifted
+        cmd = "eexpmap eventset={evts} imageset={img} expimageset={eimg} withdetcoords=no withvignetting=yes " \
+              "attitudeset={att} pimin={l} pimax={u}".format(evts=evt_path, img=high_en_im_path,
+                                                             eimg=high_en_expmap_path,
+                                                             att=file_locs["e" + ins.lower() + "_att"],
+                                                             l=z_highen[0], u=z_highen[1])
+        cmds.append(cmd)
+
         cmd = "specgroup groupedset={grpfile} spectrumset={spfile} arfset={arfile} rmfset={rmfile} minSN=1 " \
               "oversample=3 backgndset={bspec}".format(grpfile=grp_path, spfile=spec_path, arfile=arf_path,
                                                        rmfile=rmf_path, bspec=back_spec_path)
@@ -268,8 +357,8 @@ def command_stack_maker(conf_dict, obj_id, obs_id, file_locs, src_r, excl_r, sav
         cmd = "rm -r {o}_{ins}_temp".format(ins=ins, o=obj_id)
         cmds.append(cmd)
 
-        return ';'.join(cmds)
-    return ""
+        return ';'.join(cmds), file_locs
+    return "", file_locs
 
 
 def coords_rad_regions(conf_dict, obs, im_path, ra, dec, rad, force_user_rad=False):
@@ -311,8 +400,8 @@ def coords_rad_regions(conf_dict, obs, im_path, ra, dec, rad, force_user_rad=Fal
 
     poss_source_reg = []
     i = separations.index(min(separations))
-    # Identifies possible source region, but only if its a point source
-    if separations[i] < reg_summary[i][2] == reg_summary[i][3]:
+    # Identifies possible source region, isn't quite valid for elliptical source regions but ah well
+    if separations[i] < reg_summary[i][2] or separations[i] < reg_summary[i][3]:
         poss_source_reg.append(i)
 
     source_reg = None
@@ -320,15 +409,13 @@ def coords_rad_regions(conf_dict, obs, im_path, ra, dec, rad, force_user_rad=Fal
         source_reg = reg_summary.pop(poss_source_reg[0])
         separations.pop(poss_source_reg[0])
     elif len(poss_source_reg) == 0:
-        onwards.write("No XAPA region, closest is {0} pixels away, "
-                      "setting radius to {1} arcsec.".format(round(min(separations), 2), rad))
+        deg_min_sep = abs(deg_pix_wcs.all_pix2world(cen_pix[0] + min(separations), cen_pix[1], 0)[0] - ra)*3600
+        onwards.write("No XAPA region, closest is {0} arcseconds away, "
+                      "setting radius to {1} arcsec.".format(round(deg_min_sep, 2), round(rad, 2)))
     elif len(poss_source_reg) == 1 and force_user_rad:
-        onwards.write("Forcing the radius to {} arcseconds".format(rad))
+        onwards.write("Forcing the radius to {} arcseconds".format(round(rad, 2)))
         separations.pop(poss_source_reg[0])
         source_reg = None
-
-    # TODO Make this do extended sources properly, so they can be properly subtracted (though it would probs be a
-    #  rare circumstance
 
     if source_reg is None:
         # If no matching XAPA region was found, we use the values passed into the function
@@ -346,10 +433,12 @@ def coords_rad_regions(conf_dict, obs, im_path, ra, dec, rad, force_user_rad=Fal
     sources_within_lim = [i for i, sep in enumerate(separations) if sep < pix_rad+50]
     exclude_sky = [pix_to_sky(*reg_summary[i][:3]) for i in sources_within_lim]
 
+    # TODO Make sure this returns ellipses, then modify the SAS functions to make sure they define ellipses
     return source_sky, exclude_sky
 
 
 def run_sas(cmd, pass_shell, pass_stdout, pass_stderr, conf_dict):
+    sas_version = conf_dict["sas_version"]
     sp = conf_dict["samp_path"]
     try:
         if "epicspeccombine" not in cmd:
@@ -368,17 +457,19 @@ def run_sas(cmd, pass_shell, pass_stdout, pass_stderr, conf_dict):
         ins = spec_file.split("_")[2]
 
         # call(cmd, shell=pass_shell, stdout=pass_stdout, stderr=pass_stderr)
-        with open(sp + "xmm_spectra/{o}/{oi}_{i}_sasgen.log".format(o=obs_id, oi=obj_id, i=ins), 'w') as loggy:
+        log_name = sp + "xmm_spectra_sas{v}/{o}/{oi}_{i}_sasgen.log".format(o=obs_id, oi=obj_id, i=ins, v=sas_version)
+        with open(log_name, 'w') as loggy:
             call(cmd, shell=pass_shell, stderr=loggy, stdout=loggy)
 
         try:
-            spec = fits.open(conf_dict["samp_path"] + "xmm_spectra/{o}/".format(o=obs_id) + spec_file, mode="update")
-            spec[1].header["BACKFILE"] = sp + "xmm_spectra/{o}/".format(o=obs_id) + back_spec_file
+            sp_path = conf_dict["samp_path"] + "xmm_spectra_sas{v}/{o}/".format(o=obs_id, v=sas_version) + spec_file
+            spec = fits.open(sp_path, mode="update")
+            spec[1].header["BACKFILE"] = sp + "xmm_spectra_sas{v}/{o}/".format(o=obs_id, v=sas_version) + back_spec_file
             if "epicspeccombine" not in cmd:
-                spec[1].header["ANCRFILE"] = sp + "xmm_spectra/{o}/".format(o=obs_id) + arf_file
-                spec[1].header["RESPFILE"] = sp + "xmm_spectra/{o}/".format(o=obs_id) + rmf_file
+                spec[1].header["ANCRFILE"] = sp + "xmm_spectra_sas{v}/{o}/".format(o=obs_id, v=sas_version) + arf_file
+                spec[1].header["RESPFILE"] = sp + "xmm_spectra_sas{v}/{o}/".format(o=obs_id, v=sas_version) + rmf_file
             else:
-                spec[1].header["RESPFILE"] = sp + "xmm_spectra/{o}/".format(o=obs_id) + resp_file
+                spec[1].header["RESPFILE"] = sp + "xmm_spectra_sas{v}/{o}/".format(o=obs_id, v=sas_version) + resp_file
                 spec.flush()
             spec.flush()
         except FileNotFoundError:
@@ -447,7 +538,7 @@ def nh_lookup(ra, dec):
     return float(value)
 
 
-def ecfs_calc(parameters, obj_id, obs_id, save_dir, ins):
+def ecfs_calc(parameters, obj_id, obs_id, save_dir, ins, make_plots, redshift):
     def check_response_status(rsp_file):
         if not os.path.exists(rsp_file):
             use_it = False
@@ -455,7 +546,8 @@ def ecfs_calc(parameters, obj_id, obs_id, save_dir, ins):
             use_it = True
         elif os.path.exists(rsp_file) and "arf" in rsp_file:
             arf_opened = fits.open(rsp_file)
-            if arf_opened[1].data["SPECRESP"].sum() == 0:
+            nan_arr = isnan(arf_opened[1].data["SPECRESP"])
+            if arf_opened[1].data["SPECRESP"].sum() == 0 or True in nan_arr:
                 use_it = False
             else:
                 use_it = True
@@ -475,9 +567,6 @@ def ecfs_calc(parameters, obj_id, obs_id, save_dir, ins):
         for_plotting[m] = {"energies": [], "rates": [], "folded_model": []}
 
         model_pars = parameters[m]
-        if "redshift" in model_pars and not isinstance(model_pars["redshift"], (float, int)):
-            sys.exit("Ranges of redshift are not allowed!")
-
         # Calculates the number of rows in the parameter space for this model/parameter selection
         num_rows = 1
         for par in model_pars:
@@ -498,7 +587,7 @@ def ecfs_calc(parameters, obj_id, obs_id, save_dir, ins):
     run_inst_arf = check_response_status(arf_path)
 
     for m_df in model_dfs:
-        if not os.path.exists("{0}_{1}_{2}_ecfs.csv".format(obj_id, model, ins)) and (run_inst_rmf and run_inst_arf):
+        if not os.path.exists("{0}_{1}_ecf_lum_table.csv".format(obj_id, model)) and (run_inst_rmf and run_inst_arf):
             current_df = model_dfs[m_df].copy()
             current_df = current_df.assign(ph_per_sec_lowen=-1, flux_lowen=-1, ph_per_sec_highen=-1, flux_highen=-1,
                                            ph_per_sec_wideen=-1, flux_wideen=-1)
@@ -513,43 +602,57 @@ def ecfs_calc(parameters, obj_id, obs_id, save_dir, ins):
                 # pyXSPEC insists on writing a spec file for fakeit, so I immediately delete it.
                 os.remove(fake_settings.fileName)
 
-                fake_spec.ignore("**-0.5 10.0-**")
+                fake_spec.ignore("**-0.3 10.0-**")
                 x.Fit.perform()
 
-                x.Plot.device = '/null'
-                x.Plot.xAxis = "keV"
-                x.Plot('data')
-                for_plotting[m_df]["energies"].append(x.Plot.x())
-                for_plotting[m_df]["rates"].append(x.Plot.y())
-                for_plotting[m_df]["folded_model"].append(x.Plot.model())
+                if make_plots:
+                    x.Plot.device = '/null'
+                    x.Plot.xAxis = "keV"
+                    x.Plot('data')
+                    for_plotting[m_df]["energies"].append(x.Plot.x())
+                    for_plotting[m_df]["rates"].append(x.Plot.y())
+                    for_plotting[m_df]["folded_model"].append(x.Plot.model())
 
-                # x_mod.setPars(0)
-                # x.AllModels.calcFlux("0.5 2.0 err")
-                x.AllModels.calcFlux("0.5 2.0")
-                lowen_flux = fake_spec.flux[0]
-                # x.AllModels.calcFlux("2.0 10.0 err")
-                x.AllModels.calcFlux("2.0 10.0")
-                highen_flux = fake_spec.flux[0]
+                # Now to find source frame limits
+                z_lowen = [limit / (redshift + 1) for limit in [0.5, 2.0]]
+                z_highen = [limit / (redshift + 1) for limit in [2.0, 10.0]]
+                # Count rate measurements have to come before I zero the absorption, as we'll be measuring absorbed c/r
 
                 # Have to use an ignore to get a count rate for the energy range I care about
-                fake_spec.ignore("**-0.5 2.0-**")
+                fake_spec.ignore("**-{l} {u}-**".format(l=z_lowen[0], u=z_lowen[1]))
                 # the 0th element of rate is the background subtracted rate, but doesn't matter -> no background!
-                current_df.loc[par_ind, "ph_per_sec_lowen"] = fake_spec.rate[0]
-                current_df.loc[par_ind, "flux_lowen"] = lowen_flux
+                lowen_rate = fake_spec.rate[0]
 
                 # Now reset the ignore to ignore nothing
                 fake_spec.notice("all")
                 # And now ignore to get the high energy range
-                fake_spec.ignore("**-2.0 10.0-**")
-                current_df.loc[par_ind, "ph_per_sec_highen"] = fake_spec.rate[0]
-                current_df.loc[par_ind, "flux_highen"] = highen_flux
+                fake_spec.ignore("**-{l} {u}-**".format(l=z_highen[0], u=z_highen[1]))
+                highen_rate = fake_spec.rate[0]
 
+                """# THIS ISN'T USED AT THE MOMENT AND SHOULD PROBABLY BE CHUCKED OUT
                 # Now reset the ignore to ignore nothing
                 fake_spec.notice("all")
                 # And now ignore to get the energy range used in the paper
                 fake_spec.ignore("**-0.5 8.0-**")
                 current_df.loc[par_ind, "ph_per_sec_wideen"] = fake_spec.rate[0]
-                current_df.loc[par_ind, "flux_wideen"] = highen_flux
+                current_df.loc[par_ind, "flux_wideen"] = highen_flux"""
+
+                fake_spec.notice("all")
+                # Sort of janky way of finding of one of nH absorption models is being used, definitely not rigorous
+                if "abs" in m_df:
+                    # TODO Make this check the parameter dict, and find position based on that
+                    # This should zero nH, which means the calculated fluxes will be unabsorbed (according to Paul)
+                    x_mod.setPars(0)
+
+                x.AllModels.calcFlux("{l} {u}".format(l=z_lowen[0], u=z_lowen[1]))
+                lowen_flux = fake_spec.flux[0]
+                x.AllModels.calcFlux("{l} {u}".format(l=z_highen[0], u=z_highen[1]))
+                highen_flux = fake_spec.flux[0]
+
+                current_df.loc[par_ind, "ph_per_sec_lowen"] = lowen_rate
+                current_df.loc[par_ind, "flux_lowen"] = lowen_flux
+                current_df.loc[par_ind, "ph_per_sec_highen"] = highen_rate
+                current_df.loc[par_ind, "flux_highen"] = highen_flux
 
                 x.AllData.clear()
                 x.AllModels.clear()
@@ -585,88 +688,50 @@ def fake_spec_plots(for_plotting, save_dir, obj_id):
     # sample sizes will be so small I don't care about the penalty
     os.chdir(save_dir)
 
-    # This sets up the pyplot stuff for factor plots of all the models
-    factor_fig, ax_arr = plt.subplots(1, len(model_list), figsize=(len(model_list)*10.5, 10))
-
-    for m, subplot in ndenumerate(ax_arr):
-        subplot.minorticks_on()
-        subplot.tick_params(axis='both', direction='in', which='both', top=True, right=True)
-        subplot.grid(linestyle='dotted', linewidth=1)
-        subplot.axis(option="tight")
-    factor_fig.suptitle("Conversion Factors", fontsize=14, y=0.95, x=0.51)
-
     # Now we start plotting
     for m_ind, m in enumerate(model_list):
-        images = []
-        pn_output_df = pd.read_csv("{0}_{1}_{2}_ecfs.csv".format(obj_id, m, "PN"), header="infer")
-        mos2_output_df = pd.read_csv("{0}_{1}_{2}_ecfs.csv".format(obj_id, m, "MOS2"), header="infer")
+        if not os.path.exists("{0}_{1}.gif".format(obj_id, m)):
+            images = []
+            output_df = pd.read_csv("{0}_{1}_ecf_lum_table.csv".format(obj_id, m), header="infer")
 
-        # Makes plots of the conversion factor for PN and MOS1 - reading in which isn't great but oh well
-        # First need to calculate the factors
-        pn_output_df["factor_lowen"] = pn_output_df["flux_lowen"] / pn_output_df["ph_per_sec_lowen"]
-        pn_output_df["factor_highen"] = pn_output_df["flux_highen"] / pn_output_df["ph_per_sec_highen"]
+            for col_ind, col in enumerate(output_df.columns.values):
+                if "ph_per_sec" in col:
+                    break
+            p_space = output_df.drop(output_df.columns.values[col_ind-1:], axis=1)
+            p_cols = p_space.columns.values
+            # Finds maximum value of the fake spectrum fitted models, then makes it 10% larger, for plot limit
+            # max_y = max([max(entry) for entry in split_models[m]["PN"]["folded_model"]]) * 1.1
+            max_y = max([max(entry) for inst in split_models[m] for entry in split_models[m][inst]["folded_model"]])*1.1
 
-        mos2_output_df["factor_lowen"] = mos2_output_df["flux_lowen"] / mos2_output_df["ph_per_sec_lowen"]
-        mos2_output_df["factor_highen"] = mos2_output_df["flux_highen"] / mos2_output_df["ph_per_sec_highen"]
+            ins = list(split_models[m].keys())[0]
+            for i in range(0, len(split_models[m][ins]["energies"])):
+                fig = plt.figure(99, figsize=(8, 6))
+                ax = plt.gca()
+                ax.minorticks_on()
+                ax.tick_params(axis='both', direction='in', which='both', top=True, right=True)
+                ax.grid(linestyle='dotted', linewidth=1)
+                ax.axis(option="tight")
+                ax.set_xlabel("Energy (keV)", fontsize=10)
+                ax.set_ylabel(r"Normalised Counts s$^{-1} $keV$^{-1}$", fontsize=10)
+                ax.set_ylim(0.001, max_y)
+                ax.set_yscale("log")
+                t_str = "{} Fake Spectrum - ".format(m) + " ".join(["{0}={1}".format(c, '{:.2f}'.format(
+                    round(p_space.loc[i, c], 2))) for c in p_cols])
+                ax.set_title(t_str, fontsize=10)
 
-        maximum = max(mos2_output_df["factor_lowen"].max(), mos2_output_df["factor_highen"].max(),
-                      pn_output_df["factor_lowen"].max(), pn_output_df["factor_highen"].max()) * 1.2
-        minimum = min(mos2_output_df["factor_lowen"].min(), mos2_output_df["factor_highen"].min(),
-                      pn_output_df["factor_lowen"].min(), pn_output_df["factor_highen"].min()) * 0.8
+                for ins in for_plotting:
+                    plt.plot(split_models[m][ins]["energies"][i], split_models[m][ins]["folded_model"][i], label=ins)
 
-        try:
-            factor_ax = ax_arr[m_ind]
-        except TypeError:
-            factor_ax = ax_arr
+                plt.legend(loc="upper right")
+                # To convert the figure to a numpy array and allow it to be saved to a gif by mimsave
+                fig.canvas.draw()
+                image_from_plot = frombuffer(fig.canvas.tostring_rgb(), dtype=uint8)
+                image_from_plot = image_from_plot.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+                images.append(image_from_plot)
+                plt.close(99)
 
-        factor_ax.plot([minimum, maximum], [minimum, maximum], color="red", linestyle="dashed", label="One to One")
-        factor_ax.plot(mos2_output_df["factor_lowen"], pn_output_df["factor_lowen"], "+", label="0.50-2.00keV")
-        factor_ax.plot(mos2_output_df["factor_highen"], pn_output_df["factor_highen"], "x", label="2.00-10.00keV")
-        factor_ax.legend(loc="best")
-
-        factor_ax.set_xlabel("MOS2 Conversion Factor")
-        factor_ax.set_ylabel("PN Conversion Factor")
-        factor_ax.set_xlim(minimum, maximum)
-        factor_ax.set_ylim(minimum, maximum)
-        factor_ax.set_title(m)
-
-        p_space = pn_output_df.drop(["ph_per_sec_lowen", "flux_lowen", "ph_per_sec_highen", "flux_highen",
-                                     "factor_lowen", "factor_highen", "flux_wideen", "ph_per_sec_wideen",
-                                     "pred_lowen_flux", "pred_highen_flux", "pred_lowen_lum", "pred_highen_lum"],
-                                    axis=1)
-        p_cols = p_space.columns.values
-        # Finds maximum value of PN fake spectrum fitted model, then makes it 10% larger, for plot limit
-        max_y = max([max(entry) for entry in split_models[m]["PN"]["folded_model"]]) * 1.1
-        for i in range(0, len(split_models[m]["PN"]["energies"])):
-            fig = plt.figure(99, figsize=(8, 6))
-            ax = plt.gca()
-            ax.minorticks_on()
-            ax.tick_params(axis='both', direction='in', which='both', top=True, right=True)
-            ax.grid(linestyle='dotted', linewidth=1)
-            ax.axis(option="tight")
-            ax.set_xlabel("Energy (keV)", fontsize=10)
-            ax.set_ylabel(r"Normalised Counts s$^{-1} $keV$^{-1}$", fontsize=10)
-            ax.set_ylim(0.001, max_y)
-            ax.set_yscale("log")
-            t_str = "{} Fake Spectrum - ".format(m) + " ".join(["{0}={1}".format(c, '{:.2f}'.format(
-                round(p_space.loc[i, c], 2))) for c in p_cols])
-            ax.set_title(t_str, fontsize=10)
-
-            for ins in for_plotting:
-                plt.plot(split_models[m][ins]["energies"][i], split_models[m][ins]["folded_model"][i], label=ins)
-
-            plt.legend(loc="upper right")
-            # To convert the figure to a numpy array and allow it to be saved to a gif by mimsave
-            fig.canvas.draw()
-            image_from_plot = frombuffer(fig.canvas.tostring_rgb(), dtype=uint8)
-            image_from_plot = image_from_plot.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-            images.append(image_from_plot)
-            plt.close(99)
-
-        imageio.mimsave("{0}_{1}.gif".format(obj_id, m), images, fps=8)
-
-    factor_fig.savefig("{}_factors.png".format(obj_id), bbox_inches='tight')
-    plt.close("all")
+            imageio.mimsave("{0}_{1}.gif".format(obj_id, m), images, fps=7)
+        plt.close("all")
 
 
 def photon_rate_command(conf_dict, file_locs, obj_id, src_region, excl_regions, save_dir, ins, en, obj_type):
@@ -676,7 +741,6 @@ def photon_rate_command(conf_dict, file_locs, obj_id, src_region, excl_regions, 
     if obj_type == "ext":
         psf_model = "EXTENDED"
     elif obj_type == "pnt":
-        # TODO Ask Paul which PSF models I should be using
         psf_model = "ELLBETA"
     else:
         psf_model = None
@@ -755,137 +819,227 @@ def photon_rate_command(conf_dict, file_locs, obj_id, src_region, excl_regions, 
 def interpret_cr_file(output_path):
     with open(output_path, 'r') as out:
         output_lines = out.readlines()
-    cnt_rate = [entry for entry in output_lines if "upper limit" in entry][0]
-    cnt_rate = float(cnt_rate.split("c/r: ")[-1].split(" c/s")[0])
+    up_cnt_rate = [entry for entry in output_lines if "upper limit" in entry][0]
+    up_cnt_rate = float(up_cnt_rate.split("c/r: ")[-1].split(" c/s")[0])
 
-    return cnt_rate
+    back_sub_rate_line = [entry for entry in output_lines if "Bckgnd subtracted source c/r" in entry][0]
+    back_sub_rate = float(back_sub_rate_line.split("c/r: ")[-1].split(" +/-")[0])
+    back_sub_rate_err = float(back_sub_rate_line.split("+/- ")[-1])
 
+    exp_line = [entry for entry in output_lines if "exposure time" in entry][0]
+    exp_time = float(exp_line.split("exposure time: ")[-1])
 
-def calc_lum(ins, model_dfs, obj_id, save_dir):
-    os.chdir(save_dir)
-    l_en_output = save_dir + "/{s}_e".format(s=obj_id) + ins.lower() + "_lowen_output.txt"
-    h_en_output = save_dir + "/{s}_e".format(s=obj_id) + ins.lower() + "_highen_output.txt"
-    l_en_rate = interpret_cr_file(l_en_output)
-    h_en_rate = interpret_cr_file(h_en_output)
-
-    l_en_flux_col = "pred_lowen_flux"
-    h_en_flux_col = "pred_highen_flux"
-    l_en_lum_col = "pred_lowen_lum"
-    h_en_lum_col = "pred_highen_lum"
-    for m_df in model_dfs:
-        if not os.path.exists("{0}_{1}_{2}_ecfs.csv".format(obj_id, m_df, ins)):
-            model_dfs[m_df].loc[:, l_en_flux_col] = (model_dfs[m_df]["flux_lowen"] /
-                                                     model_dfs[m_df]["ph_per_sec_lowen"]) * l_en_rate
-            model_dfs[m_df].loc[:, h_en_flux_col] = (model_dfs[m_df]["flux_highen"] /
-                                                     model_dfs[m_df]["ph_per_sec_highen"]) * h_en_rate
-
-            model_dfs[m_df][l_en_lum_col] = flux_to_lum(model_dfs[m_df][l_en_flux_col], model_dfs[m_df]["redshift"])
-            model_dfs[m_df][h_en_lum_col] = flux_to_lum(model_dfs[m_df][h_en_flux_col], model_dfs[m_df]["redshift"])
-            model_dfs[m_df].to_csv("{0}_{1}_{2}_ecfs.csv".format(obj_id, m_df, ins), index=False)
-
-    return model_dfs
+    return {"up_lim": up_cnt_rate, "bsub_rate": back_sub_rate, "bsub_rate_err": back_sub_rate_err,
+            "exp_time": exp_time}
 
 
-def flux_to_lum(flux, redshift):
-    lum_dist = Planck15.luminosity_distance(redshift).to("cm")
-    return (4 * pi * lum_dist.value**2) * flux
+def calc_lums(all_dfs, save_dir, obj_id, conf_level, z_col):
+    def flux_to_lum(flux, redshift):
+        lum_dist = Planck15.luminosity_distance(redshift).to("cm")
+        return (4 * pi * lum_dist.value ** 2) * flux
 
+    # For the time being I will only care about count rate uncertainties, not any measurement uncertainties on the ECF
+    def cnt_rate_dist(factor, redshift, cnt_rate, cnt_rate_err, cnt_rate_low_lim):
+        lum_distributions = []
+        lum_med = []
+        lum_pl = []
+        lum_mi = []
+        for i, z in enumerate(redshift):
+            # Requires an upper limit, so I give it an absurdly large count rate which is likely impossible
+            samples = truncnorm.rvs((cnt_rate_low_lim - cnt_rate) / cnt_rate_err, (10000000-cnt_rate)/cnt_rate_err,
+                                    loc=cnt_rate, scale=cnt_rate_err, size=10000)
+            lum_distribution = flux_to_lum(factor[i]*samples, z)
+            med = percentile(lum_distribution, 50)
+            pl_err = percentile(lum_distribution, 50 + (conf_level/2)) - med
+            mi_err = med - percentile(lum_distribution, 50 - (conf_level/2))
+            lum_med.append(med)
+            lum_pl.append(pl_err)
+            lum_mi.append(mi_err)
+            lum_distributions += list(lum_distribution)
 
-def calc_comb_lum(all_dfs, save_dir, obj_id):
+        whole_med = percentile(lum_distributions, 50)
+        whole_pl = percentile(lum_distributions, 50 + (conf_level/2)) - whole_med
+        whole_mi = whole_med - percentile(lum_distributions, 50 - (conf_level/2))
+
+        return lum_med, lum_pl, lum_mi, lum_distributions, whole_med, whole_pl, whole_mi
+
+    en_bands = ["lowen", "highen"]
+    lum_dfs = {}
     inst_list = list(all_dfs.keys())
     model_list = list(all_dfs[inst_list[0]].keys())
     split_models = {mod: {ins: None for ins in inst_list} for mod in model_list}
-
-    en_bands = ["lowen", "highen"]
-    cols = []
-    for en in en_bands:
-        cols.append("comb_{e}_ph_rate".format(e=en))
-        cols.append("comb_{e}_flux".format(e=en))
-    cols += ["comb_pred_lowen_flux", "comb_pred_lowen_lum", "comb_pred_highen_flux", "comb_pred_highen_lum"]
-
     # This data wrangling bit is horrible, I probably should have just iterated instrument inside of ecfs_calc, but
     # here we are
     for ins in all_dfs:
         for m in model_list:
             split_models[m][ins] = all_dfs[ins][m]
 
-    comb_pred = {}
-    for m in split_models:
-        if not os.path.exists(save_dir + "/{s}_{m}_comb_pred.csv".format(s=obj_id, m=m)):
-            empty_dat = zeros((list(split_models[m].values())[0].shape[0], len(cols)))
-            comb_lum_df = pd.DataFrame(columns=cols, data=empty_dat)
-            rates = {en: 0 for en in en_bands}
-            for ins in split_models[m]:
-                for en in en_bands:
-                    comb_lum_df["comb_{e}_ph_rate".format(e=en)] += split_models[m][ins]["ph_per_sec_{e}".format(e=en)]
-                    # Using an average flux when adding them together
-                    comb_lum_df["comb_{e}_flux".format(e=en)] += (split_models[m][ins]["flux_{e}".format(e=en)] /
-                                                                  len(split_models[m]))
+    for m_df in deepcopy(split_models):
+        if not os.path.exists("{0}_{1}_ecf_lum_table.csv".format(obj_id, m_df)) \
+                or not os.path.exists("{0}_{1}_comb_pred.csv".format(obj_id, m_df)):
+            # Here I shall setup a summary Lx dataframe, where ULx is the upper limit luminosity for each model, and
+            # MLx is the median luminosity for each model based on MC-ing the count rate error
+            mod_cols = [n for n in split_models[m_df][inst_list[0]].columns.values if "pred" not in n and
+                        "lum" not in n]
+            cols = mod_cols.copy()
+            glob_mod_cols = []
 
-                    o_file = save_dir + "/{s}_e{i}_{e}_output.txt".format(s=obj_id, i=ins.lower(), e=en)
-                    rates[en] += interpret_cr_file(o_file)
+            rates = {}
+            for en in en_bands:
+                for ins in deepcopy(split_models[m_df]):
+                    try:
+                        out_file = save_dir + "/{s}_e{i}_{e}_output.txt".format(s=obj_id, i=ins.lower(), e=en)
+                        rates["{i}_{e}".format(i=ins, e=en)] = interpret_cr_file(out_file)
+
+                        r = rates["{i}_{e}".format(i=ins, e=en)]
+                        if r["exp_time"] == 0 or r["up_lim"] <= 0 or r["bsub_rate"] <= 0 or r["bsub_rate_err"] <= 0:
+                            split_models[m_df].pop(ins)
+                            onwards.write("{0} {1} dropped due to bad eregionanalyse file".format(obj_id, m_df))
+                        else:
+                            rates["{i}_{e}".format(i=ins,
+                                                   e=en)]["min_rate"] = 1/rates["{i}_{e}".format(i=ins,
+                                                                                                 e=en)]["exp_time"]
+                    except FileNotFoundError:
+                        split_models[m_df].pop(ins)
+                        onwards.write("{0} {1} dropped due to bad eregionanalyse file".format(obj_id, m_df))
 
             for en in en_bands:
-                f = (comb_lum_df["comb_{e}_flux".format(e=en)] / comb_lum_df["comb_{e}_ph_rate".format(e=en)]) \
-                    * rates[en]
-                comb_lum_df["comb_pred_{e}_flux".format(e=en)] = f
+                for ins in split_models[m_df]:
+                    cols.append("{i}_{e}_ULx".format(i=ins, e=en))
+                    cols.append("{i}_{e}_MLx".format(i=ins, e=en))
+                    glob_mod_cols.append("{i}_{e}_MLx".format(i=ins, e=en))
+                    cols.append("{i}_{e}_MLx+".format(i=ins, e=en))
+                    glob_mod_cols.append("{i}_{e}_MLx+".format(i=ins, e=en))
+                    cols.append("{i}_{e}_MLx-".format(i=ins, e=en))
+                    glob_mod_cols.append("{i}_{e}_MLx-".format(i=ins, e=en))
+                glob_mod_cols.append("all_{e}_MLx".format(e=en))
+                glob_mod_cols.append("all_{e}_MLx+".format(e=en))
+                glob_mod_cols.append("all_{e}_MLx-".format(e=en))
 
-                # Just take the redshifts from the last instrument accessed, they will be the same for all
-                lum = flux_to_lum(comb_lum_df["comb_pred_{e}_flux".format(e=en)], split_models[m][ins]["redshift"])
-                comb_lum_df["comb_pred_{e}_lum".format(e=en)] = lum
+            model_pars_lum_summary = pd.DataFrame(columns=cols)
+            global_lum_summary = pd.DataFrame(columns=glob_mod_cols)
+            inst_list = list(split_models[m_df].keys())
+            if len(inst_list) == 0:
+                continue
 
-            comb_lum_df.to_csv(save_dir + "/{s}_{m}_comb_pred.csv".format(s=obj_id, m=m), index=False)
+            for mod_col in mod_cols:
+                model_pars_lum_summary.loc[:, mod_col] = split_models[m_df][inst_list[0]][mod_col]
+
+            for en in en_bands:
+                all_ins_distribution = []
+                for ins in split_models[m_df]:
+                    r = rates["{}_{}".format(ins, en)]
+                    df = split_models[m_df][ins]
+                    ecf = df["flux_{}".format(en)] / df["ph_per_sec_{}".format(en)]
+                    f = ecf * r["up_lim"]
+                    model_pars_lum_summary.loc[:, "{i}_{e}_ULx".format(i=ins, e=en)] = flux_to_lum(f, df[z_col])
+                    mlx, mlx_pl, mlx_mi, whole_dist, whole_mlx, whole_mlx_pl, whole_mlx_mi \
+                        = cnt_rate_dist(ecf, df[z_col], r["bsub_rate"], r["bsub_rate_err"], r["min_rate"])
+                    all_ins_distribution += whole_dist
+
+                    model_pars_lum_summary.loc[:, "{i}_{e}_MLx".format(i=ins, e=en)] = mlx
+                    model_pars_lum_summary.loc[:, "{i}_{e}_MLx+".format(i=ins, e=en)] = mlx_pl
+                    model_pars_lum_summary.loc[:, "{i}_{e}_MLx-".format(i=ins, e=en)] = mlx_mi
+
+                    global_lum_summary.loc[0, "{i}_{e}_MLx".format(i=ins, e=en)] = whole_mlx
+                    global_lum_summary.loc[0, "{i}_{e}_MLx+".format(i=ins, e=en)] = whole_mlx_pl
+                    global_lum_summary.loc[0, "{i}_{e}_MLx-".format(i=ins, e=en)] = whole_mlx_mi
+
+                all_inst_med = percentile(all_ins_distribution, 50)
+                all_inst_pl = percentile(all_ins_distribution, 50 + (conf_level/2)) - all_inst_med
+                all_inst_mi = all_inst_med - percentile(all_ins_distribution, 50 - (conf_level/2))
+                global_lum_summary.loc[0, "all_{e}_MLx".format(e=en)] = all_inst_med
+                global_lum_summary.loc[0, "all_{e}_MLx+".format(e=en)] = all_inst_pl
+                global_lum_summary.loc[0, "all_{e}_MLx-".format(e=en)] = all_inst_mi
+
+            model_pars_lum_summary.to_csv("{0}_{1}_ecf_lum_table.csv".format(obj_id, m_df), index=False)
+            global_lum_summary.to_csv("{0}_{1}_comb_pred.csv".format(obj_id, m_df), index=False)
+
         else:
-            comb_lum_df = pd.read_csv(save_dir + "/{s}_{m}_comb_pred.csv".format(s=obj_id, m=m), header="infer")
+            model_pars_lum_summary = pd.read_csv("{0}_{1}_ecf_lum_table.csv".format(obj_id, m_df), header="infer")
+            global_lum_summary = pd.read_csv("{0}_{1}_comb_pred.csv".format(obj_id, m_df), header="infer")
 
-        comb_pred[m] = comb_lum_df
+        lum_dfs[m_df] = {"par_table": model_pars_lum_summary, "marg_pred": global_lum_summary}
 
-    return comb_pred
+    return lum_dfs
 
 
-def lum_plots(for_plotting, combined_for_plotting, save_dir, obj_id):
-    inst_list = list(for_plotting.keys())
-    model_list = list(for_plotting[inst_list[0]].keys())
-    split_models = {mod: {ins: None for ins in inst_list} for mod in model_list}
-
-    # This data wrangling bit is horrible, I probably should have just iterated instrument inside of ecfs_calc, but
-    # here we are
-    for ins in for_plotting:
-        for m in model_list:
-            split_models[m][ins] = for_plotting[ins][m]
-
+def lum_plots(lum_dfs, save_dir, obj_id):
     en_bands = ["lowen", "highen"]  # Will add wideen to this at some point, 0.5-8.0keV like in the paper
 
-    for m in model_list:
+    for m in lum_dfs:
+        conf_insts = []
+        for ins in ["PN", "MOS1", "MOS2"]:
+            for col in lum_dfs[m]["par_table"].columns.values:
+                if ins in col:
+                    conf_insts.append(ins)
+        # Set removes any duplicates, then sorting ensures the same order which should mean colours are more consistent
+        conf_insts = list(set(conf_insts))
+        conf_insts.sort()
         if not os.path.exists("{sav}/{o}_{mod}_pred_lum_dist.png".format(sav=save_dir, o=obj_id, mod=m)):
-            lum_fig, ax_arr = plt.subplots(1, len(en_bands), figsize=(len(en_bands) * 12, 10))
+            lum_fig, ax_arr = plt.subplots(2, len(en_bands), figsize=(len(en_bands)*8, 16), sharex="col", sharey="col")
 
             for m_ind, subplot in ndenumerate(ax_arr):
                 subplot.minorticks_on()
                 subplot.tick_params(axis='both', direction='in', which='both', top=True, right=True)
                 subplot.grid(linestyle='dotted', linewidth=1)
                 subplot.axis(option="tight")
-            lum_fig.suptitle(r"Predicted Luminosity Distributions", fontsize=14, y=0.95, x=0.51)
+            lum_fig.suptitle(r"Predicted Luminosity Distributions", fontsize=14, y=0.91, x=0.51)
 
             # Plot the distributions on histograms
             for en_ind, en in enumerate(en_bands):
-                cur_ax = ax_arr[en_ind]
-                # cur_ax.set_xscale("log")
-                cur_ax.set_title(en)
-                cur_ax.set_xlabel("L$_x$")
-                cur_ax.set_ylabel("Density")
-                for ins in inst_list:
-                    cur_ax.hist(split_models[m][ins]["pred_{}_lum".format(en)],
-                                bins="auto", label="{0} {1}".format(m, ins), alpha=0.7, density=True)
-                cur_ax.hist(combined_for_plotting[m]["comb_pred_{e}_lum".format(e=en)], bins="auto",
-                            label="{0} {1}".format(m, "Combined"), alpha=0.7, density=True)
-                cur_ax.legend(loc="best")
+                for l_type_ind, l_type in enumerate(["ULx", "MLx"]):
+                    cur_ax = ax_arr[l_type_ind, en_ind]
+                    if l_type == "ULx":
+                        cur_ax.set_title(en + " Upper Limit Luminosities")
+                    elif l_type == "MLx":
+                        cur_ax.set_title(en + " Median Luminosities")
+                    cur_ax.set_xlabel("L$_x$")
+                    cur_ax.set_ylabel("Density")
+                    colours = []
+                    for ins in conf_insts:
+                        if l_type == "ULx":
+                            cur_ax.hist(lum_dfs[m]["par_table"]["{i}_{e}_ULx".format(i=ins, e=en)], bins="auto",
+                                        label="{0} {1}".format(m, ins), alpha=0.7, density=True)
+                        elif l_type == "MLx":
+                            mlx_hist = cur_ax.hist(lum_dfs[m]["par_table"]["{i}_{e}_MLx".format(i=ins, e=en)],
+                                                   bins="auto", label="{0} {1}".format(m, ins), alpha=0.7,
+                                                   density=True)
+                            colours.append(mlx_hist[2][0].get_facecolor())
+
+                    # Unfortunately have to do two loops of the same parameters because the hists set the ylims
+                    for ins_ind, ins in enumerate(conf_insts):
+                        if l_type == "MLx":
+                            y_pos = cur_ax.get_ylim()[1] * ((ins_ind+1)/6)
+                            colour = colours[ins_ind]
+                            cur_ax.plot(lum_dfs[m]["marg_pred"]["{i}_{e}_MLx".format(i=ins, e=en)], y_pos, "o",
+                                        color=colour, alpha=0.7)  # label="{0} {1} Marg MLx".format(m, ins)
+
+                            cur_ax.errorbar(lum_dfs[m]["marg_pred"]["{i}_{e}_MLx".format(i=ins, e=en)], y_pos,
+                                            xerr=[lum_dfs[m]["marg_pred"]["{i}_{e}_MLx-".format(i=ins, e=en)],
+                                                  lum_dfs[m]["marg_pred"]["{i}_{e}_MLx+".format(i=ins, e=en)]],
+                                            color=colour, alpha=0.7)
+
+                    if l_type == "MLx":
+                        y_pos = cur_ax.get_ylim()[1] * 0.7
+                        all_line = cur_ax.plot(lum_dfs[m]["marg_pred"]["all_{e}_MLx".format(i=ins, e=en)], y_pos, "d",
+                                               alpha=0.7, label="{} Combined".format(m))
+                        cur_ax.errorbar(lum_dfs[m]["marg_pred"]["all_{e}_MLx".format(i=ins, e=en)], y_pos,
+                                        xerr=[lum_dfs[m]["marg_pred"]["all_{e}_MLx-".format(i=ins, e=en)],
+                                              lum_dfs[m]["marg_pred"]["all_{e}_MLx+".format(i=ins, e=en)]],
+                                        color=all_line[0].get_color(), alpha=0.7)
+                    cur_ax.legend(loc="best")
+
             plt.savefig("{sav}/{o}_{mod}_pred_lum_dist.png".format(sav=save_dir, o=obj_id, mod=m),
                         bbox_inches='tight')
             plt.close("all")
 
 
-def run_ecfs(conf_dict):
+def run_ecfs(conf_dict, red_list):
+    glob_stacks = {}
+    for m in conf_dict["models"]:
+        glob_stacks[m] = pd.DataFrame(columns=[conf_dict["id_col"], conf_dict["xmm_obsid_col"]])
+
     # Ugly method but works because I planned to do multithreading of this bit
     x.Fit.statMethod = "cstat"
     x.Fit.query = "yes"
@@ -893,13 +1047,13 @@ def run_ecfs(conf_dict):
 
     insts = ["PN", "MOS1", "MOS2"]
     ecfs_onwards = tqdm(total=len(ecfs_iterables) * len(insts), desc="Generating ECFS Files")
-    for le_pars in ecfs_iterables:
+    for counter, le_pars in enumerate(ecfs_iterables):
         all_inst_spec = {inst: None for inst in insts}
         all_inst_dfs = {inst: None for inst in insts}
         for inst in insts:
             try:
-                ecfs_onwards.write("{o} - {i}".format(o=le_pars[2], i=inst))
-                spectra, conv_dfs = ecfs_calc(*le_pars, inst)
+                ecfs_onwards.write("{ob} - {o} - {i}".format(ob=le_pars[1], o=le_pars[2], i=inst))
+                spectra, conv_dfs = ecfs_calc(*le_pars, inst, conf_dict["produce_plots"], red_list[counter])
                 if None not in spectra.values():
                     all_inst_spec[inst] = spectra
                 else:
@@ -909,7 +1063,6 @@ def run_ecfs(conf_dict):
                     if conv_dfs[entry] is None:
                         conv_dfs.pop(entry)
                 if len(conv_dfs) != 0:
-                    conv_dfs = calc_lum(inst, conv_dfs, le_pars[1], le_pars[-1])
                     all_inst_dfs[inst] = conv_dfs
                 else:
                     all_inst_dfs.pop(inst)
@@ -923,37 +1076,68 @@ def run_ecfs(conf_dict):
             x.AllModels.clear()
 
             ecfs_onwards.update(1)
-        if "MOS2" in list(all_inst_spec.keys()) and "PN" in list(all_inst_spec.keys()) and conf_dict["produce_plots"]:
-            fake_spec_plots(all_inst_spec, le_pars[-1], le_pars[1])
 
-        combined_lum = calc_comb_lum(all_inst_dfs, le_pars[-1], le_pars[1])
-        if conf_dict["produce_plots"]:
-            lum_plots(all_inst_dfs, combined_lum, le_pars[-1], le_pars[1])
-    ecfs_onwards.close()
+        try:
+            lum_info = calc_lums(all_inst_dfs, le_pars[-1], le_pars[1], conf_dict["conf_level"],
+                                 conf_dict["redshift_col"])
+            for m in lum_info:
+                df_row = pd.DataFrame(columns=[conf_dict["id_col"], conf_dict["xmm_obsid_col"]],
+                                      data=[[le_pars[1], le_pars[2]]])
+                for col in lum_info[m]["par_table"].columns.values:
+                    if "ULx" in col:
+                        # Median value across all the model parameters
+                        df_row.loc[0, col] = percentile(lum_info[m]["par_table"][col], 50)
+                df_row = pd.concat([df_row, lum_info[m]["marg_pred"]], axis=1, sort=False)
+
+                glob_stacks[m] = pd.concat([glob_stacks[m], df_row], axis=0, sort=False)
+            if conf_dict["produce_plots"]:
+                try:
+                    lum_plots(lum_info, le_pars[-1], le_pars[1])
+                    fake_spec_plots(all_inst_spec, le_pars[-1], le_pars[1])
+                except FileNotFoundError as e:
+                    onwards.write(str(e))
+        except IndexError as out_e:
+            onwards.write(str(out_e))
+
+    return glob_stacks
 
 
 def validate_samp_file(conf_dict):
+    def rad_to_arcseconds(rads, rad_unit, redshifts):
+        # This returns the equivelant to 1 radian of seperation at a given redshift
+        ang_diam_dists = Planck15.angular_diameter_distance(redshifts)
+        # So here we're finding how many radians our given radius is, then converting to arcseconds
+        ang_rads = ((rads * u.Unit(rad_unit)) / ang_diam_dists).decompose().value * (180 / pi) * 3600
+        return ang_rads
+
     samp = pd.read_csv(conf_dict["sample_csv"], header="infer", dtype={config["id_col"]: str, "OBSID": str})
 
     for entry in conf_dict:
         if "col" in entry and conf_dict[entry] not in samp.columns.values:
             sys.exit("{e} column is missing from the sample csv!".format(e=conf_dict[entry]))
 
-    if "type" not in samp.columns.values:
-        sys.exit("Please add a type column to your sample, with values of ext or pnt")
+    len_allowed = len(samp[samp[conf_dict["type_col"]] == "ext"]) + len(samp[samp[conf_dict["type_col"]] == "pnt"])
+    if not len_allowed == len(samp):
+        sys.exit("Only ext and pnt are allowed in the type column")
 
-    if "rad" not in samp.columns.values:
-        sys.exit("Please add a rad column to your sample, with extraction radii in arcseconds")
-    return samp
+    if config["rad_unit"] not in ["arcsecond", "arcsec"]:
+        new_rads = rad_to_arcseconds(samp[config["rad_col"]].values, config["rad_unit"],
+                                     samp[config["redshift_col"]].values)
+        samp[conf_dict["rad_col"]] = new_rads
+        conf_dict["rad_unit"] = "arcsec"
+
+    return samp, conf_dict
 
 
 if __name__ == "__main__":
+    # Throws errors if you've not a new enough version of Python
     if sys.version_info[0] < 3:
         sys.exit("You cannot run this tool with Python 2.x")
     elif sys.version_info[1] < 6:
         # warnings.warn("Be wary, before Python 3.6 dictionaries aren't necessarily ordered")
         sys.exit("Be wary, before Python 3.6 dictionaries aren't necessarily ordered")
 
+    # Shouts at the user and tells them what they need to pass, if they don't give any arguments
     required_args = ["Configuration JSON"]
     if len(sys.argv) != len(required_args) + 1:
         print('Please pass the following arguments: ')
@@ -963,28 +1147,39 @@ if __name__ == "__main__":
         config_file = sys.argv[1]
         with open(sys.argv[1], 'r') as conf:
             config = json.load(conf)
+        # Goes through the entries and makes sure they're all as they should be, in terms of datatype etc.
         config = validate_config(config)
     else:
         sys.exit('That config file does not exist!')
 
-    xmm_samp = validate_samp_file(config)
-    if not os.path.exists(config["samp_path"] + "/xmm_spectra"):
-        os.mkdir(config["samp_path"] + "/xmm_spectra")
-
-    if os.environ["SAS_PATH"].lower().split("/sas_")[-1].split(".")[0] == "17":
+    # This isn't particularly universal for computers other than Kraken, but figures out which version of SAS is loaded
+    sas_v = os.environ["SAS_PATH"].lower().split("/sas_")[-1].split(".")[0]
+    if sas_v == "17":
+        # Newer SAS than Apollo means we have to regenerate all the CCF files before ARF/RMFGEN
         update_ccf = True
-    else:
+    elif sas_v == "14":
         update_ccf = False
+    else:
+        sys.exit("Don't recognise the SAS version you're using, talk to David he can fix this")
     print("You're using SAS version {v}".format(v=os.environ["SAS_PATH"].lower().split("/sas_")[-1].split(".")[0]))
+    print("")
+    config["sas_version"] = sas_v
+
+    # Checks that the sample file is correctly structured, and has all the headers it should, also converts radii
+    xmm_samp, config = validate_samp_file(config)
+    # New directory to store all the SAS products and other files
+    if not os.path.exists(config["samp_path"] + "/xmm_spectra_sas{}".format(sas_v)):
+        os.mkdir(config["samp_path"] + "/xmm_spectra_sas{}".format(sas_v))
 
     sasgen_stack = []
     combine_stack = []
     le_flux_stack = []
     ecfs_iterables = []
+    redshift_list = []
     onwards = tqdm(desc="Preparing SAS commands for candidates", total=len(xmm_samp))
     for ind, row in xmm_samp.iterrows():
         for x_id in row["OBSID"].split(","):
-            s_dir = config["samp_path"] + "xmm_spectra/{o}".format(o=x_id)
+            s_dir = config["samp_path"] + "xmm_spectra_sas{v}/{o}".format(o=x_id, v=sas_v)
 
             # This is for the ECFS effort later on
             interim = []
@@ -994,8 +1189,15 @@ if __name__ == "__main__":
             for model in list(config["models"].keys()):
                 if "nH" in par_copy[model]:
                     par_copy[model]["nH"] = nH
-                if "redshift" in par_copy[model]:
-                    par_copy[model]["redshift"] = row["redshift"]
+
+                if config["redshift_col"] in par_copy[model]:
+                    par_copy[model][config["redshift_col"]] = row[config["redshift_col"]]
+                elif "redshift" in par_copy[model] or "z" in par_copy[model]:
+                    onwards.write("Please make the redshift entry in your model the same as your choice for "
+                                  "redshift_col config parameter.\nIf you're using a model with no redshift but have "
+                                  "named a non-redshift parameter 'z' in your model config, please change it to "
+                                  "something else!")
+                    sys.exit()
 
             interim.append(par_copy)
             interim.append(row[config["id_col"]])
@@ -1007,6 +1209,8 @@ if __name__ == "__main__":
 
             src = config["xmm_data_path"] + x_id + "/"
             src = os.path.abspath(src) + "/"
+            # Here we set up the paths of all the important files, the im and expmap paths will be modified by
+            # command_stack_maker
             f_loc = {"epn_lowen_im": "{s}images/{o}-0.50-2.00keV-pn_merged_img.fits".format(s=src, o=x_id),
                      "emos1_lowen_im": "{s}images/{o}-0.50-2.00keV-mos1_merged_img.fits".format(s=src, o=x_id),
                      "emos2_lowen_im": "{s}images/{o}-0.50-2.00keV-mos2_merged_img.fits".format(s=src, o=x_id),
@@ -1023,24 +1227,31 @@ if __name__ == "__main__":
                      "emos2_lowen_expmap": "{s}images/{o}-0.50-2.00keV-mos2_merged_expmap.fits".format(s=src, o=x_id),
                      "epn_highen_expmap": "{s}images/{o}-2.00-10.00keV-pn_merged_expmap.fits".format(s=src, o=x_id),
                      "emos1_highen_expmap": "{s}images/{o}-2.00-10.00keV-mos1_merged_expmap.fits".format(s=src, o=x_id),
-                     "emos2_highen_expmap": "{s}images/{o}-2.00-10.00keV-mos2_merged_expmap.fits".format(s=src, o=x_id)}
+                     "emos2_highen_expmap": "{s}images/{o}-2.00-10.00keV-mos2_merged_expmap.fits".format(s=src, o=x_id),
+                     "epn_att": "{s}epchain/P{o}OBX000ATTTSR0000.FIT".format(s=src, o=x_id),
+                     "emos1_att": "{s}emchain/P{o}OBX000ATTTSR0000.FIT".format(s=src, o=x_id),
+                     "emos2_att": "{s}emchain/P{o}OBX000ATTTSR0000.FIT".format(s=src, o=x_id)}
 
-            # Input radius in arcseconds, 15 is about PSF size so good place to start.
+            # Input radius in arcseconds
             try:
                 src_reg, excl_reg = coords_rad_regions(config, x_id, f_loc["epn_lowen_im"], row[config["ra_col"]],
-                                                       row[config["dec_col"]], row["rad"], config["force_rad"])
+                                                       row[config["dec_col"]], row[config["rad_col"]],
+                                                       config["force_rad"])
                 # Makes sure there are no problems before adding to the list that will be run
                 ecfs_iterables.append(interim)
-            except (FileNotFoundError, ValueError, KeyError):
+                redshift_list.append(row[config["redshift_col"]])
+            except (FileNotFoundError, ValueError, KeyError) as error:
+                onwards.write(str(error))
                 break
 
             for instrument in ["PN", "MOS1", "MOS2"]:
-                command = command_stack_maker(config, row[config["id_col"]], x_id, f_loc, src_reg, excl_reg, s_dir,
-                                              instrument, row["type"], for_comb=False)
+                command, f_loc = command_stack_maker(config, row[config["id_col"]], x_id, f_loc, src_reg, excl_reg,
+                                                     s_dir, instrument, row[config["type_col"]],
+                                                     config["generate_combined"], row[config["redshift_col"]])
                 sasgen_stack.append(command)
                 for energy in ["lowen", "highen"]:
                     command = photon_rate_command(config, f_loc, row[config["id_col"]], src_reg, excl_reg, s_dir,
-                                                  instrument, energy, row["type"])
+                                                  instrument, energy, row[config["type_col"]])
                     le_flux_stack.append(command)
 
             command = combine_stack_maker(row[config["id_col"]], x_id, f_loc, s_dir)
@@ -1049,16 +1260,13 @@ if __name__ == "__main__":
         onwards.update(1)
     onwards.close()
 
-    sas_pool(sasgen_stack, "Generating Spectra", config, cpu_count=config["allowed_cores"])
+    sas_pool(sasgen_stack, "Generating SAS Products", config, cpu_count=config["allowed_cores"])
     if config["generate_combined"]:
         sas_pool(combine_stack, "Combining Spectra", config, cpu_count=config["allowed_cores"])
-    sas_pool(le_flux_stack, "Measuring upper limit photon rates", config, cpu_count=22)
-    run_ecfs(config)
+    sas_pool(le_flux_stack, "Measuring upper limit photon rates", config, cpu_count=config["allowed_cores"])
+    model_global_dfs = run_ecfs(config, redshift_list)
 
-
-
-
-
-
-
+    for m in model_global_dfs:
+        model_global_dfs[m].to_csv(config["samp_path"] +
+                                   "xmm_spectra_sas{0}/{1}_lums.csv".format(config["sas_version"], m), index=False)
 
