@@ -22,7 +22,7 @@ from astropy.units import UnitConversionError
 from astropy import wcs
 from astropy.cosmology import Planck15
 from astropy.io import fits
-from numpy import sqrt, linspace, meshgrid, empty, uint8, frombuffer, ndenumerate, pi, percentile, isnan
+from numpy import sqrt, linspace, meshgrid, empty, uint8, frombuffer, ndenumerate, pi, percentile, isnan, nan
 from scipy.stats import truncnorm
 from tqdm import tqdm
 
@@ -64,7 +64,7 @@ def validate_config(conf_dict):
 
     required_head = ["sample_csv", "generate_combined", "force_rad", "xmm_data_path", "xmm_reg_path", "produce_plots",
                      "back_outer_factor", "id_col", "ra_col", "dec_col", "rad_col", "rad_unit", "models",
-                     "allowed_cores", "conf_level"]
+                     "allowed_cores", "instruments", "conf_level"]
 
     missing = False
     for el in required_head:
@@ -127,7 +127,7 @@ def validate_config(conf_dict):
     if not isinstance(conf_dict["models"], dict):
         sys.exit("models must be supplied as a dictionary, even if you are only using one")
     else:
-        print("REDSHIFT IS READ FROM THE SAMPLE, AND NH IS READ FROM HEASOFT, VALUES IN MODEL WILL BE DISCARDED")
+        print("REDSHIFT IS READ FROM THE SAMPLE, AND NH IS READ FROM HEASOFT, VALUES IN MODEL WILL BE DISCARDED\n")
         # print("PARAMETERS MUST BE IN THE ORDER THAT XSPEC EXPECTS THEM")
         for entry in conf_dict["models"]:
             conf_dict["models"][entry] = model_parser(conf_dict["models"][entry])
@@ -153,7 +153,7 @@ def validate_config(conf_dict):
             if isinstance(le_error, UnitConversionError) and conf_dict["rad_unit"] not in ["arcsecond", "arcsec"]:
                 sys.exit(str(le_error))
             elif isinstance(le_error, UnitConversionError) and conf_dict["rad_unit"] in ["arcsecond", "arcsec"]:
-                print("arcsecond is not a valid length unit in astropy, but this code accounts for that")
+                print("arcsecond is not a valid length unit in astropy, but this code accounts for that\n")
             else:
                 sys.exit(conf_dict["rad_unit"] + " does not appear to be a valid Astropy unit.")
 
@@ -165,6 +165,16 @@ def validate_config(conf_dict):
 
     if not isinstance(conf_dict["xmm_obsid_col"], str):
         sys.exit("xmm_obsid_col must be a string")
+
+    if not isinstance(conf_dict["instruments"], list):
+        sys.exit("instruments must be a list of strings, even if you're only generating for one")
+    elif len(conf_dict["instruments"]) == 0:
+        sys.exit("You've passed an empty list for the instruments parameter")
+    else:
+        ins_check = [choice for choice in conf_dict["instruments"] if choice not in ["PN", "MOS1", "MOS2"]]
+        if len(ins_check) != 0:
+            print("You've passed illegal instruments: {}".format(", ".join(ins_check)))
+            sys.exit("The only legal choices for instrument are PN, MOS1, and MOS2")
 
     return conf_dict
 
@@ -589,8 +599,7 @@ def ecfs_calc(parameters, obj_id, obs_id, save_dir, ins, make_plots, redshift):
     for m_df in model_dfs:
         if not os.path.exists("{0}_{1}_ecf_lum_table.csv".format(obj_id, model)) and (run_inst_rmf and run_inst_arf):
             current_df = model_dfs[m_df].copy()
-            current_df = current_df.assign(ph_per_sec_lowen=-1, flux_lowen=-1, ph_per_sec_highen=-1, flux_highen=-1,
-                                           ph_per_sec_wideen=-1, flux_wideen=-1)
+            current_df = current_df.assign(ph_per_sec_lowen=-1, flux_lowen=-1, ph_per_sec_highen=-1, flux_highen=-1)
             for par_ind, par_comb in model_dfs[m_df].iterrows():
                 x_mod = x.Model(m_df)
                 x_mod.setPars(*par_comb.astype(float).values)
@@ -651,6 +660,7 @@ def ecfs_calc(parameters, obj_id, obs_id, save_dir, ins, make_plots, redshift):
 
                 current_df.loc[par_ind, "ph_per_sec_lowen"] = lowen_rate
                 current_df.loc[par_ind, "flux_lowen"] = lowen_flux
+
                 current_df.loc[par_ind, "ph_per_sec_highen"] = highen_rate
                 current_df.loc[par_ind, "flux_highen"] = highen_flux
 
@@ -662,7 +672,7 @@ def ecfs_calc(parameters, obj_id, obs_id, save_dir, ins, make_plots, redshift):
             for_plotting[m_df] = None
         else:
             try:
-                model_dfs[m_df] = pd.read_csv("{0}_{1}_{2}_ecfs.csv".format(obj_id, model, ins), header="infer")
+                model_dfs[m_df] = pd.read_csv("{0}_{1}_ecf_lum_table.csv".format(obj_id, model, ins), header="infer")
             except FileNotFoundError:
                 model_dfs[m_df] = None
             for_plotting[m_df] = None
@@ -845,8 +855,9 @@ def calc_lums(all_dfs, save_dir, obj_id, conf_level, z_col):
         lum_pl = []
         lum_mi = []
         for i, z in enumerate(redshift):
+            # Kathy thought using 1/exp_time as lower limit was cheating, so it'll be truncated at c/r of zero now
             # Requires an upper limit, so I give it an absurdly large count rate which is likely impossible
-            samples = truncnorm.rvs((cnt_rate_low_lim - cnt_rate) / cnt_rate_err, (10000000-cnt_rate)/cnt_rate_err,
+            samples = truncnorm.rvs((0 - cnt_rate) / cnt_rate_err, (10000000-cnt_rate)/cnt_rate_err,
                                     loc=cnt_rate, scale=cnt_rate_err, size=10000)
             lum_distribution = flux_to_lum(factor[i]*samples, z)
             med = percentile(lum_distribution, 50)
@@ -891,17 +902,28 @@ def calc_lums(all_dfs, save_dir, obj_id, conf_level, z_col):
                         out_file = save_dir + "/{s}_e{i}_{e}_output.txt".format(s=obj_id, i=ins.lower(), e=en)
                         rates["{i}_{e}".format(i=ins, e=en)] = interpret_cr_file(out_file)
 
+                        # Split out like so we can do more informative errors about eregionanalyse failures
                         r = rates["{i}_{e}".format(i=ins, e=en)]
-                        if r["exp_time"] == 0 or r["up_lim"] <= 0 or r["bsub_rate"] <= 0 or r["bsub_rate_err"] <= 0:
+                        if r["exp_time"] == 0:
                             split_models[m_df].pop(ins)
-                            onwards.write("{0} {1} dropped due to bad eregionanalyse file".format(obj_id, m_df))
+                            onwards.write("{0} - {1} - {2} dropped because exposure time is 0.".format(obj_id, m_df, ins))
+                            continue
+                        if r["up_lim"] <= 0:
+                            split_models[m_df].pop(ins)
+                            onwards.write("{0} - {1} - {2} dropped because upper limit is <= 0".format(obj_id, m_df, ins))
+                            continue
+                        if r["bsub_rate_err"] <= 0 and r["up_lim"] <= 0:
+                            split_models[m_df].pop(ins)
+                            onwards.write("{0} - {1} - {2} dropped because background subtracted "
+                                          "rate uncertainty is <= 0 and upper limit is <= 0".format(obj_id, m_df, ins))
+                            continue
                         else:
                             rates["{i}_{e}".format(i=ins,
                                                    e=en)]["min_rate"] = 1/rates["{i}_{e}".format(i=ins,
                                                                                                  e=en)]["exp_time"]
                     except FileNotFoundError:
                         split_models[m_df].pop(ins)
-                        onwards.write("{0} {1} dropped due to bad eregionanalyse file".format(obj_id, m_df))
+                        onwards.write("{0} {1} {2} eregionanalyse file is missing!".format(obj_id, m_df, ins))
 
             for en in en_bands:
                 for ins in split_models[m_df]:
@@ -932,18 +954,28 @@ def calc_lums(all_dfs, save_dir, obj_id, conf_level, z_col):
                     df = split_models[m_df][ins]
                     ecf = df["flux_{}".format(en)] / df["ph_per_sec_{}".format(en)]
                     f = ecf * r["up_lim"]
+                    model_pars_lum_summary.loc[:, "{i}_{e}_ECF".format(i=ins, e=en)] = ecf
                     model_pars_lum_summary.loc[:, "{i}_{e}_ULx".format(i=ins, e=en)] = flux_to_lum(f, df[z_col])
-                    mlx, mlx_pl, mlx_mi, whole_dist, whole_mlx, whole_mlx_pl, whole_mlx_mi \
-                        = cnt_rate_dist(ecf, df[z_col], r["bsub_rate"], r["bsub_rate_err"], r["min_rate"])
-                    all_ins_distribution += whole_dist
+                    if r["bsub_rate_err"] != 0:
+                        mlx, mlx_pl, mlx_mi, whole_dist, whole_mlx, whole_mlx_pl, whole_mlx_mi \
+                            = cnt_rate_dist(ecf, df[z_col], r["bsub_rate"], r["bsub_rate_err"], r["min_rate"])
+                        all_ins_distribution += whole_dist
 
-                    model_pars_lum_summary.loc[:, "{i}_{e}_MLx".format(i=ins, e=en)] = mlx
-                    model_pars_lum_summary.loc[:, "{i}_{e}_MLx+".format(i=ins, e=en)] = mlx_pl
-                    model_pars_lum_summary.loc[:, "{i}_{e}_MLx-".format(i=ins, e=en)] = mlx_mi
+                        model_pars_lum_summary.loc[:, "{i}_{e}_MLx".format(i=ins, e=en)] = mlx
+                        model_pars_lum_summary.loc[:, "{i}_{e}_MLx+".format(i=ins, e=en)] = mlx_pl
+                        model_pars_lum_summary.loc[:, "{i}_{e}_MLx-".format(i=ins, e=en)] = mlx_mi
 
-                    global_lum_summary.loc[0, "{i}_{e}_MLx".format(i=ins, e=en)] = whole_mlx
-                    global_lum_summary.loc[0, "{i}_{e}_MLx+".format(i=ins, e=en)] = whole_mlx_pl
-                    global_lum_summary.loc[0, "{i}_{e}_MLx-".format(i=ins, e=en)] = whole_mlx_mi
+                        global_lum_summary.loc[0, "{i}_{e}_MLx".format(i=ins, e=en)] = whole_mlx
+                        global_lum_summary.loc[0, "{i}_{e}_MLx+".format(i=ins, e=en)] = whole_mlx_pl
+                        global_lum_summary.loc[0, "{i}_{e}_MLx-".format(i=ins, e=en)] = whole_mlx_mi
+                    else:
+                        model_pars_lum_summary.loc[:, "{i}_{e}_MLx".format(i=ins, e=en)] = nan
+                        model_pars_lum_summary.loc[:, "{i}_{e}_MLx+".format(i=ins, e=en)] = nan
+                        model_pars_lum_summary.loc[:, "{i}_{e}_MLx-".format(i=ins, e=en)] = nan
+
+                        global_lum_summary.loc[0, "{i}_{e}_MLx".format(i=ins, e=en)] = nan
+                        global_lum_summary.loc[0, "{i}_{e}_MLx+".format(i=ins, e=en)] = nan
+                        global_lum_summary.loc[0, "{i}_{e}_MLx-".format(i=ins, e=en)] = nan
 
                 all_inst_med = percentile(all_ins_distribution, 50)
                 all_inst_pl = percentile(all_ins_distribution, 50 + (conf_level/2)) - all_inst_med
@@ -964,12 +996,12 @@ def calc_lums(all_dfs, save_dir, obj_id, conf_level, z_col):
     return lum_dfs
 
 
-def lum_plots(lum_dfs, save_dir, obj_id):
+def lum_plots(lum_dfs, save_dir, obj_id, chosen_insts):
     en_bands = ["lowen", "highen"]  # Will add wideen to this at some point, 0.5-8.0keV like in the paper
 
     for m in lum_dfs:
         conf_insts = []
-        for ins in ["PN", "MOS1", "MOS2"]:
+        for ins in chosen_insts:
             for col in lum_dfs[m]["par_table"].columns.values:
                 if ins in col:
                     conf_insts.append(ins)
@@ -1036,6 +1068,7 @@ def lum_plots(lum_dfs, save_dir, obj_id):
 
 
 def run_ecfs(conf_dict, red_list):
+    # TODO The way this handles previously run files is a hot mess, and should be redone when I can be bothered
     glob_stacks = {}
     for m in conf_dict["models"]:
         glob_stacks[m] = pd.DataFrame(columns=[conf_dict["id_col"], conf_dict["xmm_obsid_col"]])
@@ -1045,7 +1078,7 @@ def run_ecfs(conf_dict, red_list):
     x.Fit.query = "yes"
     x.Xset.chatter = 0
 
-    insts = ["PN", "MOS1", "MOS2"]
+    insts = conf_dict["instruments"]
     ecfs_onwards = tqdm(total=len(ecfs_iterables) * len(insts), desc="Generating ECFS Files")
     for counter, le_pars in enumerate(ecfs_iterables):
         all_inst_spec = {inst: None for inst in insts}
@@ -1077,6 +1110,7 @@ def run_ecfs(conf_dict, red_list):
 
             ecfs_onwards.update(1)
 
+        # This IndexError exception is for when the ECF calculation has failed (normally due to missing SAS products
         try:
             lum_info = calc_lums(all_inst_dfs, le_pars[-1], le_pars[1], conf_dict["conf_level"],
                                  conf_dict["redshift_col"])
@@ -1084,7 +1118,7 @@ def run_ecfs(conf_dict, red_list):
                 df_row = pd.DataFrame(columns=[conf_dict["id_col"], conf_dict["xmm_obsid_col"]],
                                       data=[[le_pars[1], le_pars[2]]])
                 for col in lum_info[m]["par_table"].columns.values:
-                    if "ULx" in col:
+                    if "ULx" in col or "ECF" in col:
                         # Median value across all the model parameters
                         df_row.loc[0, col] = percentile(lum_info[m]["par_table"][col], 50)
                 df_row = pd.concat([df_row, lum_info[m]["marg_pred"]], axis=1, sort=False)
@@ -1092,12 +1126,13 @@ def run_ecfs(conf_dict, red_list):
                 glob_stacks[m] = pd.concat([glob_stacks[m], df_row], axis=0, sort=False)
             if conf_dict["produce_plots"]:
                 try:
-                    lum_plots(lum_info, le_pars[-1], le_pars[1])
+                    lum_plots(lum_info, le_pars[-1], le_pars[1], conf_dict["instruments"])
                     fake_spec_plots(all_inst_spec, le_pars[-1], le_pars[1])
-                except FileNotFoundError as e:
-                    onwards.write(str(e))
-        except IndexError as out_e:
-            onwards.write(str(out_e))
+                except (FileNotFoundError, IndexError) as e:
+                    # onwards.write(str(e))
+                    pass
+        except IndexError:
+            pass
 
     return glob_stacks
 
@@ -1244,7 +1279,7 @@ if __name__ == "__main__":
                 onwards.write(str(error))
                 break
 
-            for instrument in ["PN", "MOS1", "MOS2"]:
+            for instrument in config["instruments"]:
                 command, f_loc = command_stack_maker(config, row[config["id_col"]], x_id, f_loc, src_reg, excl_reg,
                                                      s_dir, instrument, row[config["type_col"]],
                                                      config["generate_combined"], row[config["redshift_col"]])

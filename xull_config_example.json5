@@ -17,5 +17,6 @@
   "models": {
     "tbabs*apec": {"nh": -1, "kT": [1, 10, 15], "abund": 0.3, "redshift": -1, "Norm": 1}},
   "allowed_cores": 20,
-  "conf_level": 90
+  "conf_level": 90,
+  "instruments": ["PN", "MOS1", "MOS2"]
 }

@@ -50,6 +50,8 @@ currently submit jobs, so it should be limited to the number allocated to your i
 * conf_level - Desired confidence level for the median luminosity calculations, 90 for instance.
 * produce_plots - Boolean option, this should be set to false if you're running in a headless screen.
 * back_outer_factor - Scaling factor applied to object radius to find outer radius of the background annulus.
+* instruments - A list of which cameras to use in the measurements, for instance ["PN", "MOS1", "MOS2"] 
+or ["PN", "MOS2"]
 * models - One of the most important, this defines the models that you wish to use to calculate your various predicted 
 luminosities. This is the most complicated so an example is given below.
 
