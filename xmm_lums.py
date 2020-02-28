@@ -486,7 +486,15 @@ def run_sas(cmd, pass_shell, pass_stdout, pass_stderr, conf_dict):
             tqdm.write("{} does not exist!".format(spec_file))
 
     except IndexError:
-        call(cmd, shell=pass_shell, stderr=pass_stderr, stdout=pass_stdout)
+        if "eregion" in cmd:
+            im_path = cmd.split("imageset='")[-1].split("'")[0]
+            obj_id, obs_id, ins, en = im_path.split("/")[-1].split("_")[0:4]
+            log_name = sp + "xmm_spectra_sas{v}/{o}/{oi}_{i}_{e}_eregionanalyse.log".format(o=obs_id, oi=obj_id, i=ins,
+                                                                                            v=sas_version, e=en)
+            with open(log_name, 'w') as loggy:
+                call(cmd, shell=pass_shell, stderr=loggy, stdout=loggy)
+        else:
+            call(cmd, shell=pass_shell, stderr=pass_stderr, stdout=pass_stdout)
 
 
 def combine_stack_maker(obj_id, obs_id, evt_files, save_dir):
