@@ -103,3 +103,19 @@ that the code has used to analyse the target. *It is important to note that the 
 regions are excluded - the colours do not have the same meaning as XAPA regions*
 
 ## Getting Real ECFs for Detected Objects
+
+No sample file is required for REDO, but a config file must still be supplied. All but one of the parameters can be 
+exactly the same as the XULL configuration file. The *models* entry should be structured exactly the same as for XULL
+apart from that lists of parameters are not allowed to be passed, as these entries should be considered the starting 
+point for a proper XSPEC fit. 
+
+### Running REDO
+
+```python
+python redo.py sample/test_paul_clusters/redo_config.json5
+```
+
+### Outputs
+The only extra output files will be saved in the xmm_spectra_sas{version} folder, one for each model you passed. The 
+true ECF for each instrument you chose to use when running XULL (for each object) will be saved there, as well as the
+low and high energy luminosities.s
