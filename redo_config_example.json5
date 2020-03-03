@@ -1,0 +1,11 @@
+{
+  "sample_csv": "samples/test_paul_clusters/sample.csv",
+  "id_col": "objid",
+  "xmm_obsid_col": "OBSID",
+  "ra_col": "ra",
+  "dec_col": "dec",
+  "redshift_col": "redshift",
+  "type_col": "type",
+  "models": {
+    "tbabs*apec": {"nh": -1, "kT": 4, "abund": 0.3, "redshift": -1, "Norm": 1}}
+}

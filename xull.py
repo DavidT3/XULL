@@ -300,6 +300,9 @@ def command_stack_maker(conf_dict, obj_id, obs_id, file_locs, src_r, excl_r, sav
                                                                                        exp=back_expression)
         cmds.append(cmd)
 
+        cmd = "backscale spectrumset={sp} badpixlocation={ev} withbadpixcorr=yes".format(sp=back_spec_path, ev=evt_path)
+        cmds.append(cmd)
+
         cmd = "evselect table={evts} imageset={img} xcolumn=X ycolumn=Y ximagebinsize=87 " \
               "yimagebinsize=87 squarepixels=yes ximagesize=512 yimagesize=512 imagebinning=binSize " \
               "ximagemin=3649 ximagemax=48106 withxranges=yes yimagemin=3649 yimagemax=48106 " \
@@ -350,7 +353,7 @@ def command_stack_maker(conf_dict, obj_id, obs_id, file_locs, src_r, excl_r, sav
                                                              l=z_highen[0], u=z_highen[1])
         cmds.append(cmd)
 
-        cmd = "specgroup groupedset={grpfile} spectrumset={spfile} arfset={arfile} rmfset={rmfile} minSN=1 " \
+        cmd = "specgroup groupedset={grpfile} spectrumset={spfile} arfset={arfile} rmfset={rmfile} mincounts=5 " \
               "oversample=3 backgndset={bspec}".format(grpfile=grp_path, spfile=spec_path, arfile=arf_path,
                                                        rmfile=rmf_path, bspec=back_spec_path)
         cmds.append(cmd)
@@ -371,12 +374,27 @@ def command_stack_maker(conf_dict, obj_id, obs_id, file_locs, src_r, excl_r, sav
     return "", file_locs
 
 
-def coords_rad_regions(conf_dict, obs, im_path, ra, dec, rad, force_user_rad=False):
+def coords_rad_regions(conf_dict, obs, im_path, ra, dec, rad, target_type, force_user_rad, save_dir, obj_id):
     def reg_extract(reg_string):
-        reg_string = reg_string.split("(")[-1].split(")")[0]
-        reg_x, reg_y, reg_x_rad, reg_y_rad, reg_ang = [float(el) for el in reg_string.split(",")]
+        reg_x, reg_y, reg_x_rad, reg_y_rad, reg_ang = [float(el) for el in
+                                                       reg_string.split("(")[-1].split(")")[0].split(",")]
+        if "#" in reg_string:
+            reg_colour = reg_string.split(" # ")[-1].split("color=")[-1].strip("\n")
+            if reg_colour == "green":
+                reg_type = "ext"
+            elif reg_colour == "magenta":
+                reg_type = "ext_psf"
+            elif reg_colour == "blue":
+                reg_type = "ext_pnt_cont"
+            elif reg_colour == "cyan":
+                reg_type = "ext_run1_cont"
+            elif reg_colour == "yellow":
+                reg_type = "ext_less_ten_counts"
+        else:
+            reg_type = "pnt"
+
         # -1 because XAPA starts counting at 1, not 0 like Python
-        return reg_x-1, reg_y-1, reg_x_rad, reg_y_rad, reg_ang
+        return reg_x-1, reg_y-1, reg_x_rad, reg_y_rad, reg_ang, reg_type
 
     def calc_sep(reg_x, reg_y):
         return sqrt((reg_x - cen_pix[0])**2 + (reg_y - cen_pix[1])**2)
@@ -389,61 +407,176 @@ def coords_rad_regions(conf_dict, obs, im_path, ra, dec, rad, force_user_rad=Fal
         sky_r = abs(edge_sky[0] - cen_sky[0])
         return sky_x, sky_y, sky_r
 
-    # Loads in an XCS generated image to help with the WCS coordinates transformations
-    im_fits = fits.open(im_path)
-    im_head = im_fits[0].header
-    # Reads in WCS for ra,dec->pixel and pixel->skycoords
-    deg_pix_wcs = wcs.WCS(im_head)
-    pix_sky_wcs = wcs.WCS(im_head, key='L')
-    im_fits.close()
-    # Convert passed ra and dec to image pixel coordinates
-    cen_pix = deg_pix_wcs.all_world2pix(ra, dec, 0)
+    def new_reg_sep_list(summary, seps, source_inds):
+        if source_inds is None:
+            return summary, seps
+        else:
+            new_reg_summary = [entry for entry_ind, entry in enumerate(summary) if entry_ind not in source_inds]
+            new_seps = [entry for entry_ind, entry in enumerate(seps) if entry_ind not in source_inds]
+            return new_reg_summary, new_seps
 
-    # Have to search XAPA regions for any sources that need to be removed from background spectrum generation
-    with open(conf_dict["xmm_reg_path"] + obs + "/final_class_regions_REDO.reg") as reggy:
-        reg_lines = reggy.readlines()
-    if "global" in reg_lines[0]:
-        reg_lines = reg_lines[1:]
+    def create_xull_reg_file(source, excluded_sources):
+        reg_line = "physical ; circle({x},{y},{r})"
+        source_line = reg_line.format(x=source[0], y=source[1], r=source[2]) + " # color=green"
+        xull_reg_lines = [reg_line.format(x=entry[0], y=entry[1], r=entry[2]) for entry in excluded_sources]
+        all_reg_lines = "\n".join(["global color=red"] + xull_reg_lines + [source_line])
+        with open(save_dir + "/{}_xull_source+excl.reg".format(obj_id), 'w') as new_reggy:
+            new_reggy.write(all_reg_lines)
 
-    reg_summary = [reg_extract(line) for line in reg_lines]
-    separations = [calc_sep(reg[0], reg[1]) for reg in reg_summary]
+    def read_xull_reg_file(f_path):
+        with open(f_path, 'r') as xull_reggy:
+            lines = xull_reggy.readlines()[1:]
 
-    poss_source_reg = []
-    i = separations.index(min(separations))
-    # Identifies possible source region, isn't quite valid for elliptical source regions but ah well
-    if separations[i] < reg_summary[i][2] or separations[i] < reg_summary[i][3]:
-        poss_source_reg.append(i)
+        read_in_source = None
+        read_in_excl = []
+        for line in lines:
+            parsed_info = [float(el) for el in line.split("(")[-1].split(")")[0].split(",")]
+            if "green" in line:
+                read_in_source = parsed_info
+            else:
+                read_in_excl.append(parsed_info)
 
-    source_reg = None
-    if len(poss_source_reg) == 1 and not force_user_rad:
-        source_reg = reg_summary.pop(poss_source_reg[0])
-        separations.pop(poss_source_reg[0])
-    elif len(poss_source_reg) == 0:
-        deg_min_sep = abs(deg_pix_wcs.all_pix2world(cen_pix[0] + min(separations), cen_pix[1], 0)[0] - ra)*3600
-        onwards.write("No XAPA region, closest is {0} arcseconds away, "
-                      "setting radius to {1} arcsec.".format(round(deg_min_sep, 2), round(rad, 2)))
-    elif len(poss_source_reg) == 1 and force_user_rad:
-        onwards.write("Forcing the radius to {} arcseconds".format(round(rad, 2)))
-        separations.pop(poss_source_reg[0])
-        source_reg = None
+        return read_in_source, read_in_excl
 
-    if source_reg is None:
-        # If no matching XAPA region was found, we use the values passed into the function
-        # Converts arcseconds to degrees
-        rad /= 3600
-        edge_pix = deg_pix_wcs.all_world2pix(ra + rad, dec, 0)
-        pix_rad = abs(cen_pix[0] - edge_pix[0])
+    if not os.path.exists(save_dir + "/{}_xull_source+excl.reg".format(obj_id)):
+        # Loads in an XCS generated image to help with the WCS coordinates transformations
+        im_fits = fits.open(im_path)
+        im_head = im_fits[0].header
+        # Reads in WCS for ra,dec->pixel and pixel->skycoords
+        deg_pix_wcs = wcs.WCS(im_head)
+        pix_sky_wcs = wcs.WCS(im_head, key='L')
+        im_fits.close()
+        # Convert passed ra and dec to image pixel coordinates
+        cen_pix = deg_pix_wcs.all_world2pix(ra, dec, 0)
+
+        # Have to search XAPA regions for any sources that need to be removed from background spectrum generation
+        with open(conf_dict["xmm_reg_path"] + obs + "/final_class_regions_REDO.reg") as reggy:
+            reg_lines = reggy.readlines()
+        if "global" in reg_lines[0]:
+            reg_lines = reg_lines[1:]
+
+        reg_summary = [reg_extract(line) for line in reg_lines]
+        max_reg_radii = [max(reg[2:4]) for reg in reg_summary]
+        separations = [calc_sep(reg[0], reg[1]) for reg in reg_summary]
+
+        # Finds if any of the target coords are inside a circle with the max radius of the XAPA region
+        # So elliptical XAPA regions become circular
+        poss_source_reg = []
+        for sep_ind, sep in enumerate(separations):
+            if reg_summary[sep_ind][-1] in ["pnt", "ext_psf"] and sep <= max_reg_radii[sep_ind]:
+                poss_source_reg.append(sep_ind)
+            elif reg_summary[sep_ind][-1] not in ["pnt", "ext_psf"] and sep <= (max_reg_radii[sep_ind] * 0.5):
+                poss_source_reg.append(sep_ind)
+
+        if len(poss_source_reg) == 0:
+            deg_min_sep = abs(deg_pix_wcs.all_pix2world(cen_pix[0] + min(separations), cen_pix[1], 0)[0] - ra) * 3600
+            onwards.write("No XAPA region, closest is {0} arcseconds away, "
+                          "setting radius to {1} arcsec.".format(round(deg_min_sep, 2), round(rad, 2)))
+            source_reg = None
+        elif len(poss_source_reg) == 1:
+            # Nesting the if statements here was just easier to read
+            # Checks if target is point source and if XAPA region is point source
+            if target_type == "pnt" and reg_summary[poss_source_reg[0]][-1] in ["pnt", "ext_psf"] \
+                    and not force_user_rad:
+                onwards.write("Target point source is in XAPA point source, setting source radius to XAPA region "
+                              "radius.")
+                source_reg = reg_summary.pop(poss_source_reg[0])
+                reg_summary, separations = new_reg_sep_list(reg_summary, separations, poss_source_reg)
+            elif target_type == "pnt" and reg_summary[poss_source_reg[0]][-1] in ["pnt", "ext_psf"] and force_user_rad:
+                onwards.write("Target point source is in XAPA point source, but forcing using sample radius.")
+                source_reg = None
+                reg_summary, separations = new_reg_sep_list(reg_summary, separations, poss_source_reg)
+            elif target_type == "pnt" and reg_summary[poss_source_reg[0]][-1] not in ["pnt", "ext_psf"]:
+                raise ValueError("Target point source inside an extended source, using sample radius, this target will "
+                                 "not be processed")
+
+            elif target_type == "ext" and reg_summary[poss_source_reg[0]][-1] != "pnt" and not force_user_rad:
+                onwards.write("Target extended source coordinates are within 50% of the radius of a XAPA extended "
+                              "source, using XAPA source.")
+                source_reg = reg_summary.pop(poss_source_reg[0])
+                reg_summary, separations = new_reg_sep_list(reg_summary, separations, poss_source_reg)
+            elif target_type == "ext" and reg_summary[poss_source_reg[0]][-1] != "pnt" and force_user_rad:
+                onwards.write("Target extended source inside a XAPA extended source, using sample radius.")
+                source_reg = None
+                reg_summary, separations = new_reg_sep_list(reg_summary, separations, poss_source_reg)
+
+            elif target_type == "ext" and reg_summary[poss_source_reg[0]][-1] == "pnt":
+                onwards.write("Target extended source coordinates match with a XAPA point source, using sample radius")
+                reg_summary, separations = new_reg_sep_list(reg_summary, separations, poss_source_reg)
+                source_reg = None
+
+            else:
+                source_reg = None
+                onwards.write("{0} target, {1} match, force_user_rad={2}".format(target_type,
+                                                                                 reg_summary[poss_source_reg[0]][-1],
+                                                                                 force_user_rad))
+                sys.exit("How did you get here?")
+
+        elif len(poss_source_reg) == 2:
+            # This doesn't cover every possible combination, because I suspect that the only way this will come up is if
+            # I'm looking for a extended source which XAPA also has a point source region inside
+            # Grabbing source which is closest to target coordinates
+            if separations[poss_source_reg[0]] < separations[poss_source_reg[1]]:
+                min_sep_ind = poss_source_reg[0]
+                other_match = poss_source_reg[1]
+            else:
+                min_sep_ind = poss_source_reg[1]
+                other_match = poss_source_reg[0]
+
+            if target_type == "ext" and reg_summary[min_sep_ind][-1] == "pnt" \
+                    and reg_summary[other_match][-1] != "pnt" and not force_user_rad:
+                onwards.write("The extended target has matched to two XAPA regions, the closest is a point source, "
+                              "the furthest is extended - will use the extended region")
+                source_reg = reg_summary.pop(other_match)
+                reg_summary, separations = new_reg_sep_list(reg_summary, separations, poss_source_reg)
+            elif target_type == "ext" and reg_summary[min_sep_ind][-1] == "pnt" \
+                    and reg_summary[other_match][-1] != "pnt" and force_user_rad:
+                onwards.write("The extended target has matched to two XAPA regions, the closest is a point source, "
+                              "the furthest is extended - using radius from sample")
+                source_reg = None
+                reg_summary, separations = new_reg_sep_list(reg_summary, separations, poss_source_reg)
+
+            elif target_type == "ext" and reg_summary[min_sep_ind][-1] != "pnt" \
+                    and reg_summary[other_match][-1] == "pnt" and not force_user_rad:
+                onwards.write("The point target has matched to two XAPA regions, the closest is an extended source, "
+                              "the furthest is a point - will use the extended region")
+                source_reg = reg_summary.pop(min_sep_ind)
+                reg_summary, separations = new_reg_sep_list(reg_summary, separations, poss_source_reg)
+            elif target_type == "ext" and reg_summary[min_sep_ind][-1] != "pnt" \
+                    and reg_summary[other_match][-1] == "pnt" and force_user_rad:
+                onwards.write("The point target has matched to two XAPA regions, the closest is an extended source, "
+                              "the furthest is a point - using radius from sample")
+                source_reg = None
+                reg_summary, separations = new_reg_sep_list(reg_summary, separations, poss_source_reg)
+            else:
+                raise ValueError("Target point source inside an extended source, using sample radius, this target will "
+                                 "not be processed")
+
+        else:
+            sys.exit("The target coordinates appear to be in {} different XAPA regions, email "
+                     "david.turner@sussex.ac.uk and tell him he needs to fix his matching "
+                     "code".format(len(poss_source_reg)))
+
+        if source_reg is None:
+            # If no matching XAPA region was found, we use the values passed into the function
+            # Converts arcseconds to degrees
+            rad /= 3600
+            edge_pix = deg_pix_wcs.all_world2pix(ra + rad, dec, 0)
+            pix_rad = abs(cen_pix[0] - edge_pix[0])
+        else:
+            # If a matching XAPA region WAS found, the central point and radius are used instead
+            cen_pix = [source_reg[0], source_reg[1]]
+            pix_rad = source_reg[2]
+        source_sky = pix_to_sky(*cen_pix, pix_rad)
+
+        # Now going to find the sources within some arbitrary large radius (50 pixels?), to make sure they're excluded
+        sources_within_lim = [i for i, sep in enumerate(separations) if sep < pix_rad+50]
+        exclude_sky = [pix_to_sky(*reg_summary[i][:2], reg_summary[i][3]) for i in sources_within_lim]
+        create_xull_reg_file(source_sky, exclude_sky)
+        
     else:
-        # If a matchin XAPA region WAS found, the central point and radius are used instead
-        cen_pix = [source_reg[0], source_reg[1]]
-        pix_rad = source_reg[2]
-    source_sky = pix_to_sky(*cen_pix, pix_rad)
+        source_sky, exclude_sky = read_xull_reg_file(save_dir + "/{}_xull_source+excl.reg".format(obj_id))
 
-    # Now going to find the sources within some arbitrary large radius (50 pixels?), just to make sure they're excluded
-    sources_within_lim = [i for i, sep in enumerate(separations) if sep < pix_rad+50]
-    exclude_sky = [pix_to_sky(*reg_summary[i][:3]) for i in sources_within_lim]
-
-    # TODO Make sure this returns ellipses, then modify the SAS functions to make sure they define ellipses
     return source_sky, exclude_sky
 
 
@@ -1279,7 +1412,8 @@ if __name__ == "__main__":
             try:
                 src_reg, excl_reg = coords_rad_regions(config, x_id, f_loc["epn_lowen_im"], row[config["ra_col"]],
                                                        row[config["dec_col"]], row[config["rad_col"]],
-                                                       config["force_rad"])
+                                                       row[config["type_col"]], config["force_rad"], s_dir,
+                                                       row[config["id_col"]])
                 # Makes sure there are no problems before adding to the list that will be run
                 ecfs_iterables.append(interim)
                 redshift_list.append(row[config["redshift_col"]])

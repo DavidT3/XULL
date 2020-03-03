@@ -9,7 +9,9 @@
 * pyXSPEC - can be a bit of a pain
 * pandas
 
-## Expected sample format
+## Getting XCS Upper Limit Luminosities
+
+### Expected sample format
 The input must be a csv with the following information:
 * Some form of unique object identifier e.g. MEM_MATCH_ID, SDSS Object ID.
 * An XMM ObsID (or several of them separated by commas but still passed as a string).
@@ -24,7 +26,7 @@ they are in the config file.
 If you don't care about the redshift of your objects, set the values in your column to zero, so rest frame values will 
 be calculated.
 
-## Structuring the config file
+### Structuring the config file
 The configuration file is passed to the script when you call it, and gives the code a lot of information that it needs.
 
 **FYI: In json files boolean variables must be all lowercase, and lists can only be defined with square brackets** 
@@ -77,13 +79,11 @@ list [start, stop, num_steps], so for instance the tbabs*apec model will try 15 
 As seen above, you can also get the code to try multiple models, simply pass them as another member of the models 
 dictionary.
 
-## Running the code
-
 ```python
-python xmm_lums.py sample/test_paul_clusters/xull_config.json5
+python xull.py sample/test_paul_clusters/xull_config.json5
 ```
 
-## Outputs
+### Outputs
 The main output files can be found at the end of the run in the xmm_spectra_sas{version} folder. 
 There will be one for each model you included, and it will be named {model}_lums.csv. Hopefully all the headers are 
 self-explanatory, but one thing to note is that the ULx value for a given energy and instrument is the median value of 
@@ -97,3 +97,25 @@ instances.
 * {id}_{model}_comb_pred.csv are basically the separate rows of the top level output file.
 * {id}_{model}.gif is only generated if produce_plots is true, and is a gif of the different model instances.
 * {id}_{model}_pred_lum_dist.png is only generated if produce_plots is true, and is a plot of the result distributions.
+
+XULL also now outputs DS9 compliant region files (in XMM XY sky coordinates), that show the source and excluded regions 
+that the code has used to analyse the target. *It is important to note that the green region is the source, and all red 
+regions are excluded - the colours do not have the same meaning as XAPA regions*
+
+## Getting Real ECFs for Detected Objects
+
+No sample file is required for REDO, but a config file must still be supplied. All but one of the parameters can be 
+exactly the same as the XULL configuration file. The *models* entry should be structured exactly the same as for XULL
+apart from that lists of parameters are not allowed to be passed, as these entries should be considered the starting 
+point for a proper XSPEC fit. 
+
+### Running REDO
+
+```python
+python redo.py sample/test_paul_clusters/redo_config.json5
+```
+
+### Outputs
+The only extra output files will be saved in the xmm_spectra_sas{version} folder, one for each model you passed. The 
+true ECF for each instrument you chose to use when running XULL (for each object) will be saved there, as well as the
+low and high energy luminosities.s
