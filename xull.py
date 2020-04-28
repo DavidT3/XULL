@@ -91,11 +91,6 @@ def validate_config(conf_dict):
         sys.exit("That xmm_data_path doesn't exist!")
     elif conf_dict["xmm_data_path"][-1] != "/":
         conf_dict["xmm_data_path"] += "/"
-    if "sftp" in conf_dict["xmm_data_path"]:
-        if os.path.exists("xmm_data"):
-            os.remove("xmm_data")
-        subprocess.call("ln -s {} xmm_data".format(conf_dict["xmm_data_path"]), shell=True)
-        conf_dict["xmm_data_path"] = os.path.abspath("xmm_data") + "/"
 
     if not isinstance(conf_dict["xmm_reg_path"], str):
         sys.exit("xmm_reg_path should be of type int!")
@@ -103,11 +98,6 @@ def validate_config(conf_dict):
         sys.exit("That xmm_reg_path doesn't exist!")
     elif conf_dict["xmm_reg_path"][-1] != "/":
         conf_dict["xmm_reg_path"] += "/"
-    if "sftp" in conf_dict["xmm_reg_path"]:
-        if os.path.exists("xmm_reg"):
-            os.remove("xmm_reg")
-        subprocess.call("ln -s {} xmm_reg".format(conf_dict["xmm_reg_path"]), shell=True)
-        conf_dict["xmm_reg_path"] = os.path.abspath("xmm_reg") + "/"
 
     if not isinstance(conf_dict["back_outer_factor"], (float, int)):
         sys.exit("back_outer_factor should be either a float or an integer")
@@ -128,7 +118,7 @@ def validate_config(conf_dict):
         sys.exit("models must be supplied as a dictionary, even if you are only using one")
     else:
         print("REDSHIFT IS READ FROM THE SAMPLE, AND NH IS READ FROM HEASOFT, VALUES IN MODEL WILL BE DISCARDED\n")
-        # print("PARAMETERS MUST BE IN THE ORDER THAT XSPEC EXPECTS THEM")
+        print("PARAMETERS MUST BE IN THE ORDER THAT XSPEC EXPECTS THEM")
         for entry in conf_dict["models"]:
             conf_dict["models"][entry] = model_parser(conf_dict["models"][entry])
 
@@ -998,8 +988,12 @@ def calc_lums(all_dfs, save_dir, obj_id, conf_level, z_col):
         for i, z in enumerate(redshift):
             # Kathy thought using 1/exp_time as lower limit was cheating, so it'll be truncated at c/r of zero now
             # Requires an upper limit, so I give it an absurdly large count rate which is likely impossible
-            samples = truncnorm.rvs((0 - cnt_rate) / cnt_rate_err, (10000000-cnt_rate)/cnt_rate_err,
-                                    loc=cnt_rate, scale=cnt_rate_err, size=10000)
+            try:
+                samples = truncnorm.rvs((0 - cnt_rate) / cnt_rate_err, (10000000-cnt_rate)/cnt_rate_err,
+                                        loc=cnt_rate, scale=cnt_rate_err, size=10000)
+            except RuntimeError:
+                samples = truncnorm.rvs(0, (10000000 - cnt_rate) / cnt_rate_err,
+                                        loc=cnt_rate, scale=cnt_rate_err, size=10000)
             lum_distribution = flux_to_lum(factor[i]*samples, z)
             med = percentile(lum_distribution, 50)
             pl_err = percentile(lum_distribution, 50 + (conf_level/2)) - med
