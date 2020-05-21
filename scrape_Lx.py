@@ -27,7 +27,7 @@ if __name__ == "__main__":
     if m_choice > len(models)-1:
         sys.exit("That wasn't a valid option")
 
-    obsid_dirs = [el for el in os.listdir(".") if len(el) == 10]
+    obsid_dirs = [el for el in os.listdir(".") if len(el) == 10 and "." not in el]
 
     found_valid_file = False
     count = 0
