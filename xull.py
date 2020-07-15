@@ -11,7 +11,7 @@ from copy import deepcopy
 from functools import partial
 from multiprocessing.dummy import Pool
 from subprocess import DEVNULL as DNULL
-from subprocess import call
+from subprocess import call, Popen, PIPE
 
 import imageio
 import matplotlib.pyplot as plt
@@ -1286,6 +1286,9 @@ def validate_samp_file(conf_dict):
         if "col" in entry and conf_dict[entry] not in samp.columns.values:
             sys.exit("{e} column is missing from the sample csv!".format(e=conf_dict[entry]))
 
+    if "OBSID" not in samp.columns.values:
+        sys.exit("OBSID column is missing from the sample csv!")
+
     len_allowed = len(samp[samp[conf_dict["type_col"]] == "ext"]) + len(samp[samp[conf_dict["type_col"]] == "pnt"])
     if not len_allowed == len(samp):
         sys.exit("Only ext and pnt are allowed in the type column")
@@ -1322,16 +1325,25 @@ if __name__ == "__main__":
     else:
         sys.exit('That config file does not exist!')
 
-    # This isn't particularly universal for computers other than Kraken, but figures out which version of SAS is loaded
-    sas_v = os.environ["SAS_PATH"].lower().split("/sas_")[-1].split(".")[0]
-    if sas_v == "17":
-        # Newer SAS than Apollo means we have to regenerate all the CCF files before ARF/RMFGEN
-        update_ccf = True
-    elif sas_v == "14":
+    # Used to check the SAS_PATH, but there's no guarantee it will be formatted the same across
+    #  computers
+    # Now we check that SAS is present, then call a terminal command that reports version
+    #  and parse the output
+    if "SAS_DIR" not in os.environ:
+        raise ImportError("Can't find SAS_DIR environment variable, please install SAS.")
+    else:
+        # This way, the user can just import the SAS_VERSION from this utils code
+        sas_out, sas_err = Popen("sas --version", stdout=PIPE, stderr=PIPE, shell=True).communicate()
+        sas_v = sas_out.decode("UTF-8").strip("]\n").split('-')[-1]
+
+    if sas_v != "14":
+        # SAS 14 is what we use on Apollo, so don't have to regenerate CCFs
         update_ccf = False
     else:
-        sys.exit("Don't recognise the SAS version you're using, talk to David he can fix this")
-    print("You're using SAS version {v}".format(v=os.environ["SAS_PATH"].lower().split("/sas_")[-1].split(".")[0]))
+        # Anything else will trigger the regeneration of CCFs, even if its an unexpected result,
+        #  means it fails safe and will keep going but err on the side of caution
+        update_ccf = True
+    print("You're using SAS version {v}".format(v=sas_v))
     print("")
     config["sas_version"] = sas_v
 
