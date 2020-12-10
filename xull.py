@@ -1393,9 +1393,9 @@ if __name__ == "__main__":
             src = os.path.abspath(src) + "/"
             # Here we set up the paths of all the important files, the im and expmap paths will be modified by
             # command_stack_maker
-            f_loc = {"epn_lowen_im": "{s}images/{o}-0.50-2.00keV-pn_merged_img.fits".format(s=src, o=x_id),
-                     "emos1_lowen_im": "{s}images/{o}-0.50-2.00keV-mos1_merged_img.fits".format(s=src, o=x_id),
-                     "emos2_lowen_im": "{s}images/{o}-0.50-2.00keV-mos2_merged_img.fits".format(s=src, o=x_id),
+            f_loc = {"epn_lowen_im": "{s}images/{o}_pn_exp1-0.50-2.00keVimg.fits".format(s=src, o=x_id),
+                     "emos1_lowen_im": "{s}images/{o}_mos1_exp1-0.50-2.00keVimg.fits".format(s=src, o=x_id),
+                     "emos2_lowen_im": "{s}images/{o}_mos2_exp1-0.50-2.00keVimg.fits".format(s=src, o=x_id),
                      "epn_evts": "{s}eclean/pn_exp1_clean_evts.fits".format(s=src, o=x_id),
                      "emos1_evts": "{s}eclean/mos1_exp1_clean_evts.fits".format(s=src, o=x_id),
                      "emos2_evts": "{s}eclean/mos2_exp1_clean_evts.fits".format(s=src, o=x_id),
